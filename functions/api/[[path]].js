@@ -118,7 +118,6 @@ async function handleProbeAPI(request, env, context, pathArray) {
         return Response.json({ success: true });
     }
     
-    // 🌟 恢复删除探针库记录接口，用于清理已经删除的 KUI 面板中的僵尸记录
     if (method === 'DELETE' && subPath === 'admin/server') {
         const id = url.searchParams.get('id');
         await db.prepare('DELETE FROM probe_servers WHERE id = ?').bind(id).run();
@@ -148,22 +147,19 @@ export async function onRequest(context) {
         return Response.json({ success: true });
     }
 
-    // 🌟 Agent 统一探针与管理上报接口 (全能入口，单次上报双向分发)
+    // 🌟 Agent 统一探针与管理上报接口
     if (action === "report" && method === "POST") {
         if (!(await verifyAuth(request.headers.get("Authorization"), db, env))) return new Response("Unauthorized", { status: 401 });
         const data = await request.json(); 
         const nowMs = Date.now();
         const vpsIp = data.ip;
 
-        // 🌟 防僵尸复活锁：判断此机器是否已在 KUI 面板被删除
         const kuiServer = await db.prepare('SELECT name FROM servers WHERE ip = ?').bind(vpsIp).first();
         if (!kuiServer) {
-            // 如果已经被删除，直接抛弃数据并返回 403，不再往 probe_servers 里插入孤儿记录
             return Response.json({ error: "Server has been removed from KUI panel." }, { status: 403 });
         }
         const serverName = kuiServer.name;
 
-        // 1. 更新 KUI 核心节点数据库
         try { 
             await db.prepare("UPDATE servers SET cpu=?, mem=?, disk=?, load=?, uptime=?, net_in_speed=?, net_out_speed=?, tcp_conn=?, udp_conn=?, last_report=?, alert_sent=0 WHERE ip=?")
                     .bind(data.cpu||0, data.mem||0, data.disk||0, data.load||'', data.uptime||'', data.net_in_speed||0, data.net_out_speed||0, data.tcp_conn||0, data.udp_conn||0, nowMs, vpsIp).run(); 
@@ -173,7 +169,6 @@ export async function onRequest(context) {
                     .bind(data.cpu||0, data.mem||0, data.disk||0, data.load||'', data.uptime||'', data.net_in_speed||0, data.net_out_speed||0, data.tcp_conn||0, data.udp_conn||0, nowMs, vpsIp).run(); 
         }
 
-        // 2. 桥接同步到 CF 探针大盘数据库
         try {
             let countryCode = request.cf && request.cf.country ? request.cf.country : 'XX'; 
             if (countryCode.toUpperCase() === 'TW') countryCode = 'CN';
@@ -221,7 +216,6 @@ export async function onRequest(context) {
 
         } catch (e) { console.error("探针数据同步失败:", e); }
 
-        // 3. 处理代理节点流量与协议更新
         const stmts = []; let totalDelta = 0;
         if (data.node_traffic && data.node_traffic.length > 0) { 
             for (let nt of data.node_traffic) { 
@@ -242,7 +236,6 @@ export async function onRequest(context) {
         return Response.json({ success: true, fast_mode: fastMode, interval: reportInterval });
     }
 
-    // 后续的 GET/PUT 等原有路由完全不变
     if (action === "config" && method === "GET") {
         if (!(await verifyAuth(request.headers.get("Authorization"), db, env))) return new Response("Unauthorized", { status: 401 });
         const ip = new URL(request.url).searchParams.get("ip"); const now = Date.now(); const adminUser = env.ADMIN_USERNAME || "admin";
