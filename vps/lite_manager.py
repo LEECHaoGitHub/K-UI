@@ -382,7 +382,13 @@ def connect_node(tun: Tunnel, node: dict):
             except: process.kill()
             dead_ips.add(node["ip"])
     finally:
-        with state_lock: tun.is_connecting = False
+        with state_lock:
+            tun.is_connecting = False
+            # 连接未成功时，释放在 maintain_pool 中预占的坑位（entry_ip），
+            # 否则该 IP 会被 get_best_candidate 的 active_ips 永久剔除，
+            # 在可用节点稀少时会导致备用通道永远填不上（负载率长期卡在 1/2）。
+            if not tun.ready:
+                tun.entry_ip = ""
 
 def health_check_loop():
     global tun_main, dead_ips
