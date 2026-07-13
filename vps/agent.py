@@ -14,6 +14,8 @@ import tempfile
 import shutil
 import hashlib
 import threading
+import configparser
+import ipaddress
 try:
     from realtime_client import RealtimeChannel
 except ImportError:
@@ -31,6 +33,19 @@ if sys.stdout.encoding != 'UTF-8':
 
 CONF_FILE = "/opt/kui/config.json"
 SINGBOX_CONF_PATH = "/etc/sing-box/config.json"
+WARP_CONF_PATH = "/opt/kui/warp.json"
+WARP_STATE_PATH = "/opt/kui/egress-state.json"
+TRAFFIC_STATE_PATH = "/opt/kui/traffic-state.json"
+WGCF_VERSION = "2.2.31"
+WGCF_ASSETS = {
+    "x86_64": ("amd64", "69147e1a517c66129edd8ac8cb60484d6c9515178d7b4a2f95e3c925f225572a"),
+    "aarch64": ("arm64", "b9bdbdeaa3f9f4ba741ba55b8bd94c24f7166c27668eb7e8192ccf9746961182"),
+}
+CLOUDFLARED_VERSION = "2026.7.1"
+CLOUDFLARED_ASSETS = {
+    "x86_64": ("amd64", "79a0ade7fc854f62c1aaef48424d9d979e8c2fcd039189d24db82b84cd146be1"),
+    "aarch64": ("arm64", "18f2c9bfc7a67a971bd96f1a5a1935def3c1e52aa386626f1566f04e9b5478d6"),
+}
 
 try:
     with open(CONF_FILE, 'r') as f:
@@ -59,6 +74,19 @@ PROXY_API = os.environ.get("PROXY_API_URL") or (env.get("proxy_api") if isinstan
 PROXY_CTRL_USER = os.environ.get("PROXY_CTRL_USER", env.get("proxy_ctrl_user", "") if isinstance(env, dict) else "")
 PROXY_CTRL_PASS = os.environ.get("PROXY_CTRL_PASS", env.get("proxy_ctrl_pass", "") if isinstance(env, dict) else "")
 REALTIME_URL = env.get("realtime_url", "") if isinstance(env, dict) else ""
+
+def _require_https_url(value, name):
+    parsed = urllib.parse.urlsplit(value or "")
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+        raise RuntimeError(f"{name} must be HTTPS without credentials or fragment")
+    return value.rstrip("/")
+
+API_URL = _require_https_url(API_URL, "api_url")
+REPORT_URL = _require_https_url(REPORT_URL, "report_url")
+BASE_URL = API_URL.rsplit('/api/', 1)[0] if '/api/' in API_URL else API_URL
+if urllib.parse.urlsplit(REPORT_URL).netloc != urllib.parse.urlsplit(BASE_URL).netloc: raise RuntimeError("report_url must use the Pages API origin")
+PROXY_API = _require_https_url(PROXY_API, "proxy_api")
+if REALTIME_URL: REALTIME_URL = _require_https_url(REALTIME_URL, "realtime_url")
 
 def _proxy_ctrl_headers():
     if PROXY_API.rstrip('/') != BASE_URL.rstrip('/') and PROXY_CTRL_USER and PROXY_CTRL_PASS:
@@ -93,6 +121,155 @@ def persist_agent_token(token):
     HEADERS["Authorization"] = token
     print("[agent] migrated to the server-specific agent token", flush=True)
 
+def _write_json_state(path, value):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    descriptor, temp_path = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as state_file:
+            json.dump(value, state_file, separators=(",", ":")); state_file.flush(); os.fsync(state_file.fileno())
+        os.chmod(temp_path, 0o600); os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path): os.remove(temp_path)
+
+def _load_traffic_state():
+    try:
+        with open(TRAFFIC_STATE_PATH, "r", encoding="utf-8") as state_file: state = json.load(state_file)
+        return state if isinstance(state, dict) else {}
+    except Exception:
+        return {}
+
+def _ensure_wgcf():
+    machine = platform.machine().lower()
+    asset = WGCF_ASSETS.get(machine)
+    if not asset:
+        raise RuntimeError(f"WARP registration is unsupported on {machine}")
+    arch, expected = asset
+    target = "/opt/kui/wgcf"
+    if os.path.exists(target):
+        with open(target, "rb") as binary:
+            if hashlib.sha256(binary.read()).hexdigest() == expected: return target
+    url = f"https://github.com/ViRb3/wgcf/releases/download/v{WGCF_VERSION}/wgcf_{WGCF_VERSION}_linux_{arch}"
+    temp_path = target + ".tmp"
+    request = urllib.request.Request(url, headers={"User-Agent": "KUI-WARP/1.0"})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        source = response.read(20 * 1024 * 1024)
+    if hashlib.sha256(source).hexdigest() != expected:
+        raise RuntimeError("wgcf checksum mismatch")
+    with open(temp_path, "wb") as binary: binary.write(source)
+    os.chmod(temp_path, 0o700)
+    os.replace(temp_path, target)
+    return target
+
+def _load_or_create_warp_profile():
+    if os.path.exists(WARP_CONF_PATH):
+        try:
+            with open(WARP_CONF_PATH, "r", encoding="utf-8") as profile_file:
+                profile = json.load(profile_file)
+            required = {"private_key", "ipv4_address", "ipv6_address", "peer_address", "peer_port", "peer_public_key"}
+            if required.issubset(profile):
+                ipv4 = ipaddress.ip_interface(profile["ipv4_address"]); ipv6 = ipaddress.ip_interface(profile["ipv6_address"]); ipaddress.ip_address(profile["peer_address"])
+                if ipv4.version != 4 or ipv6.version != 6: raise ValueError("invalid WARP address families")
+                peer_port = int(profile["peer_port"]); mtu = int(profile.get("mtu", 1280))
+                if not 1 <= peer_port <= 65535 or not 1280 <= mtu <= 1420: raise ValueError("invalid WARP port or MTU")
+                if len(base64.b64decode(profile["private_key"], validate=True)) != 32 or len(base64.b64decode(profile["peer_public_key"], validate=True)) != 32: raise ValueError("invalid WARP key")
+                os.chmod(WARP_CONF_PATH, 0o600)
+                return profile
+        except Exception:
+            pass
+    wgcf = _ensure_wgcf()
+    workdir = tempfile.mkdtemp(prefix="kui-warp-", dir="/opt/kui")
+    try:
+        registered = subprocess.run([wgcf, "register", "--accept-tos"], cwd=workdir, capture_output=True, text=True, timeout=60)
+        if registered.returncode != 0:
+            raise RuntimeError(f"WARP registration failed: {(registered.stderr or registered.stdout).strip()[-300:]}")
+        generated = subprocess.run([wgcf, "generate"], cwd=workdir, capture_output=True, text=True, timeout=30)
+        if generated.returncode != 0:
+            raise RuntimeError(f"WARP profile generation failed: {(generated.stderr or generated.stdout).strip()[-300:]}")
+        parser = configparser.ConfigParser(strict=False)
+        parser.read(os.path.join(workdir, "wgcf-profile.conf"))
+        addresses = [value.strip() for value in parser.get("Interface", "Address").split(",")]
+        ipv4_address = next((value for value in addresses if ":" not in value), "")
+        ipv6_address = next((value for value in addresses if ":" in value), "")
+        endpoint = parser.get("Peer", "Endpoint")
+        endpoint_host, endpoint_port = endpoint.rsplit(":", 1)
+        endpoint_ips = socket.getaddrinfo(endpoint_host.strip("[]"), int(endpoint_port), socket.AF_UNSPEC, socket.SOCK_DGRAM)
+        if not endpoint_ips:
+            raise RuntimeError("WARP endpoint DNS resolution failed")
+        profile = {
+            "private_key": parser.get("Interface", "PrivateKey"),
+            "ipv4_address": ipv4_address,
+            "ipv6_address": ipv6_address,
+            "peer_address": endpoint_ips[0][4][0],
+            "peer_port": int(endpoint_port),
+            "peer_public_key": parser.get("Peer", "PublicKey"),
+            "mtu": int(parser.get("Interface", "MTU", fallback="1280")),
+        }
+        if not ipv4_address or not ipv6_address:
+            raise RuntimeError("WARP registration did not return dual-stack addresses")
+        descriptor, temp_profile = tempfile.mkstemp(prefix="warp.", suffix=".tmp", dir="/opt/kui")
+        with os.fdopen(descriptor, "w", encoding="utf-8") as profile_file:
+            json.dump(profile, profile_file)
+            profile_file.flush()
+            os.fsync(profile_file.fileno())
+        os.chmod(temp_profile, 0o600)
+        os.replace(temp_profile, WARP_CONF_PATH)
+        return profile
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+def _load_warp_state():
+    try:
+        with open(WARP_STATE_PATH, "r", encoding="utf-8") as state_file:
+            state = json.load(state_file)
+        mode = state.get("applied_mode", "native")
+        if mode in {"off", "ipv4", "ipv6", "dual"}: mode = "native" if mode == "off" else f"warp_{mode}"
+        return {"applied_mode": mode, "applied_revision": int(state.get("applied_revision", 0)), "pending_result": state.get("pending_result")}
+    except Exception:
+        return {"applied_mode": "native", "applied_revision": 0, "pending_result": None}
+
+def _save_warp_state(mode, revision, pending_result=None):
+    descriptor, temp_path = tempfile.mkstemp(prefix="warp-state.", suffix=".tmp", dir="/opt/kui")
+    with os.fdopen(descriptor, "w", encoding="utf-8") as state_file:
+        json.dump({"applied_mode": mode, "applied_revision": int(revision), "pending_result": pending_result}, state_file)
+        state_file.flush(); os.fsync(state_file.fileno())
+    os.chmod(temp_path, 0o600)
+    os.replace(temp_path, WARP_STATE_PATH)
+
+def _singbox_service_healthy():
+    if os.path.exists("/etc/alpine-release"):
+        return subprocess.run(["rc-service", "sing-box", "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15).returncode == 0
+    return subprocess.run(["systemctl", "is-active", "--quiet", "sing-box"], timeout=15).returncode == 0
+
+def _verify_warp_exit(mode):
+    if mode == "off": return True
+    checks = []
+    if mode in {"ipv4", "dual"}: checks.append(("4", "http://1.1.1.1/cdn-cgi/trace"))
+    if mode in {"ipv6", "dual"}: checks.append(("6", "http://[2606:4700:4700::1111]/cdn-cgi/trace"))
+    for family, url in checks:
+        verified = False
+        for _ in range(4):
+            result = subprocess.run(["curl", "-fsS", "--connect-timeout", "5", "--max-time", "12", "--proxy", "socks5://127.0.0.1:39482", url], capture_output=True, text=True)
+            if result.returncode == 0 and "warp=on" in result.stdout.lower():
+                verified = True; break
+            time.sleep(2)
+        if not verified: raise RuntimeError(f"WARP {family[1:]} data-plane verification failed")
+    return True
+
+def _verify_residential_exit():
+    for _ in range(4):
+        result = subprocess.run(["curl", "-fsS", "--connect-timeout", "5", "--max-time", "15", "--proxy", "socks5://127.0.0.1:39482", "http://1.1.1.1/cdn-cgi/trace"], capture_output=True, text=True)
+        trace = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        if result.returncode == 0 and trace.get("ip") and trace.get("ip") != VPS_IP and trace.get("warp", "off").lower() != "on": return True
+        time.sleep(2)
+    raise RuntimeError("residential proxy data-plane verification failed")
+
+def _post_warp_result(payload):
+    parsed = urllib.parse.urlsplit(API_URL)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    request = urllib.request.Request(f"{origin}/api/egress_result", data=json.dumps({"ip": VPS_IP, **payload}).encode(), headers={**HEADERS, "Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return json.loads(response.read().decode())
+
 def check_for_update():
     global last_update_check
     now = time.time()
@@ -122,7 +299,17 @@ def check_for_update():
             if checked.returncode != 0: raise ValueError(f"{component} update compile failed: {checked.stderr.strip()}")
             changed.append((temp_path, target))
         if not changed: return False
-        for temp_path, target in changed: os.replace(temp_path, target)
+        replaced = []
+        try:
+            for temp_path, target in changed:
+                backup = target + ".last-good"
+                if os.path.exists(target): shutil.copy2(target, backup)
+                os.replace(temp_path, target); replaced.append((target, backup))
+        except Exception:
+            for target, backup in reversed(replaced):
+                if os.path.exists(backup): shutil.copy2(backup, target)
+            raise
+        _write_json_state("/opt/kui/.update-pending", {"updated_at": int(time.time()), "files": [target for _, target in changed]})
         print("[agent] components updated, restarting", flush=True)
         os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
     except Exception as error:
@@ -150,6 +337,23 @@ pending_report_id = None
 pending_report_bytes = None
 pending_node_traffic = None
 pending_report_payload = None
+_traffic_state = _load_traffic_state()
+last_reported_bytes = {str(k): int(v) for k, v in (_traffic_state.get("last_reported_bytes") or {}).items()}
+_pending = _traffic_state.get("pending") or {}
+pending_report_id = _pending.get("report_id")
+pending_report_bytes = _pending.get("report_bytes")
+pending_node_traffic = _pending.get("node_traffic")
+pending_report_payload = _pending.get("payload")
+egress_retry_timer = None
+egress_retry_lock = threading.Lock()
+
+def _schedule_egress_retry(delay):
+    global egress_retry_timer
+    with egress_retry_lock:
+        if egress_retry_timer: egress_retry_timer.cancel()
+        egress_retry_timer = threading.Timer(max(1, delay), config_wakeup.set)
+        egress_retry_timer.daemon = True
+        egress_retry_timer.start()
 
 # --- 缓存静态信息 ---
 cached_os = cached_arch = cached_cpu_info = cached_virt = None
@@ -216,7 +420,7 @@ def get_net_dev_bytes():
     except: pass
     return rx, tx
 
-def ensure_firewall_open(port):
+def ensure_firewall_open(port, transport=None):
     # 验证端口参数
     try:
         port_int = int(port)
@@ -226,7 +430,7 @@ def ensure_firewall_open(port):
         raise ValueError(f"无效的端口参数: {port}")
     
     port = str(port_int)
-    for protocol in ["tcp", "udp"]:
+    for protocol in ([transport] if transport in {"tcp", "udp"} else ["tcp", "udp"]):
         cmds = [
             f"iptables -C INPUT -p {protocol} --dport {port} -j ACCEPT 2>/dev/null || iptables -I INPUT -p {protocol} --dport {port} -j ACCEPT",
             f"iptables -C OUTPUT -p {protocol} --sport {port} -j ACCEPT 2>/dev/null || iptables -I OUTPUT -p {protocol} --sport {port} -j ACCEPT",
@@ -241,7 +445,7 @@ def ensure_firewall_open(port):
             if has_ufw: subprocess.run(f"ufw allow {port}/{protocol} >/dev/null 2>&1", shell=True, timeout=5)
         except Exception: pass
 
-def _read_iptables_port_bytes(port):
+def _read_iptables_port_bytes(port, protocol):
     """基于 ensure_firewall_open 插入的 dport(INPUT)/sport(OUTPUT) ACCEPT 规则，
     读取该端口的进出累计字节，实现真正的单节点精确计量。
     返回 None 表示未找到规则或读取失败（上层据此返回 0，避免误计）。"""
@@ -258,7 +462,7 @@ def _read_iptables_port_bytes(port):
             continue
         key_pattern = re.compile(rf'(?<!\d){re.escape(key)}(?!\d)')
         for line in out.splitlines():
-            if "ACCEPT" not in line or not key_pattern.search(line):
+            if "ACCEPT" not in line or not key_pattern.search(line) or protocol not in line.lower().split():
                 continue
             parts = line.split()
             if len(parts) < 2:
@@ -301,7 +505,7 @@ def get_port_traffic(port, protocol="tcp", node_id=None):
     # 兜底：iptables 单端口累计字节（真正的单节点计量）。
     # 注意：绝不能回退到"系统全网卡总流量"——那样每个节点都会拿到同一个总量，
     # report_status 里逐节点累加会把用户流量放大 N 倍（N=节点数）。
-    port_bytes = _read_iptables_port_bytes(port)
+    port_bytes = _read_iptables_port_bytes(port, protocol)
     if port_bytes is not None:
         return port_bytes
 
@@ -392,18 +596,21 @@ def get_system_status(current_interval):
 
 def ensure_cloudflared():
     target = "/usr/local/bin/cloudflared"
-    if os.path.isfile(target) and os.path.getsize(target) > 0:
-        return True
-    arch_map = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64", "armv7l": "arm"}
-    arch = arch_map.get(platform.machine().lower())
-    if not arch:
+    asset = CLOUDFLARED_ASSETS.get(platform.machine().lower())
+    if not asset:
         return False
+    arch, expected = asset
+    if os.path.isfile(target):
+        with open(target, "rb") as binary:
+            if hashlib.sha256(binary.read()).hexdigest() == expected: return True
     fd, tmp_path = tempfile.mkstemp(prefix="cloudflared-", dir="/usr/local/bin")
     os.close(fd)
     try:
-        result = subprocess.run(["curl", "-fL", "--retry", "3", "-o", tmp_path, f"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-{arch}"], timeout=120)
+        result = subprocess.run(["curl", "-fL", "--retry", "3", "--max-filesize", "60000000", "-o", tmp_path, f"https://github.com/cloudflare/cloudflared/releases/download/{CLOUDFLARED_VERSION}/cloudflared-linux-{arch}"], timeout=120)
         if result.returncode != 0 or os.path.getsize(tmp_path) == 0:
             return False
+        with open(tmp_path, "rb") as binary:
+            if hashlib.sha256(binary.read()).hexdigest() != expected: return False
         os.chmod(tmp_path, 0o755)
         os.replace(tmp_path, target)
         return True
@@ -478,7 +685,7 @@ def build_chain_outbound(target, tag):
         return None
     return outbound
 
-def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_outbound=None):
+def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_outbound=None, warp_mode="off"):
     global proxy_port_conflict
     singbox_config = {
         "log": {"level": "warn"},
@@ -488,10 +695,20 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
     }
     active_certs = []
     valid_nodes = []
+    listener_keys = set()
+    if warp_mode not in {"off", "ipv4", "ipv6", "dual"}:
+        raise ValueError("invalid WARP mode")
 
     for node in nodes:
         try:
-            in_tag, proto, port = f"in-{node['id']}", node["protocol"], int(node["port"])
+            node_id = str(node["id"])
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", node_id): raise ValueError("invalid node id")
+            in_tag, proto, port = f"in-{node_id}", node["protocol"], int(node["port"])
+            if not 1 <= port <= 65535: raise ValueError("invalid port")
+            transport = "udp" if proto in {"Hysteria2", "TUIC"} else "tcp"
+            listener_key = (transport, port)
+            if listener_key in listener_keys: raise ValueError(f"duplicate {transport} listener port {port}")
+            listener_keys.add(listener_key)
             supported = {"VLESS", "XTLS-Reality", "Reality", "Hysteria2", "TUIC", "Trojan", "H2-Reality", "gRPC-Reality", "AnyTLS", "Naive", "Socks5", "VLESS-Argo", "dokodemo-door"}
             if proto not in supported:
                 raise ValueError(f"unsupported protocol {proto}")
@@ -516,8 +733,8 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
                 parts = sni.split('.'); cn = f"{parts[-2]}.{parts[-1]}" if len(parts) >= 2 else sni
                 conf_path = f"/opt/kui/cert_{node['id']}.conf"
                 with open(conf_path, "w") as f: f.write(f"[req]\ndistinguished_name = req_distinguished_name\nx509_extensions = v3_req\nprompt = no\n[req_distinguished_name]\nCN = {cn}\n[v3_req]\nsubjectAltName = @alt_names\n[alt_names]\nDNS = {sni}\n")
-                os.system(f"openssl ecparam -genkey -name prime256v1 -out {key_path} >/dev/null 2>&1")
-                os.system(f"openssl req -new -x509 -days 36500 -key {key_path} -out {cert_path} -config {conf_path} -extensions v3_req >/dev/null 2>&1")
+                subprocess.run(["openssl", "ecparam", "-genkey", "-name", "prime256v1", "-out", key_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["openssl", "req", "-new", "-x509", "-days", "36500", "-key", key_path, "-out", cert_path, "-config", conf_path, "-extensions", "v3_req"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 os.chmod(cert_path, 0o644)
                 os.chmod(key_path, 0o600)
                 try: os.remove(conf_path)
@@ -593,12 +810,6 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
                     print(f"[agent] 端口 {proxy_port} 已由 proxy_server 提供服务，跳过重复 SOCKS5 入站", flush=True)
                 proxy_port_conflict = True
 
-    try:
-        for filename in os.listdir("/opt/kui/"):
-            if (filename.startswith("cert_") or filename.startswith("key_")) and filename.endswith(".pem"):
-                if filename not in active_certs: os.remove(os.path.join("/opt/kui/", filename))
-    except Exception: pass
-
     # --- 住宅IP跨VPS互联（mesh）：把本机节点出口链式转发到其它 VPS 的 SOCKS5，实现出口IP共享/轮换 ---
     mesh_enabled = bool(peers and mesh and mesh.get("enabled"))
     if mesh_enabled and socks5_outbound and socks5_outbound.get("enabled"):
@@ -649,6 +860,8 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
                 if s5_pass:
                     s5_outbound["password"] = str(s5_pass)
                 singbox_config["outbounds"].append(s5_outbound)
+                singbox_config["inbounds"].append({"type": "socks", "tag": "egress-check-in", "listen": "127.0.0.1", "listen_port": 39482})
+                singbox_config["route"]["rules"].append({"inbound": ["egress-check-in"], "outbound": s5_tag})
                 s5_mode = socks5_outbound.get("mode", "global")
                 if s5_mode == "selective":
                     # 按分类选择性出站：仅勾选的分类域名走 SOCKS5
@@ -704,8 +917,50 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
         except Exception:
             pass
 
+    if warp_mode != "off":
+        if mesh_enabled:
+            raise RuntimeError("WARP cannot be combined with residential mesh routing")
+        if socks5_outbound and socks5_outbound.get("enabled"):
+            raise RuntimeError("SOCKS5 outbound and WARP outbound cannot be enabled together")
+        profile = _load_or_create_warp_profile()
+        addresses = []
+        allowed_ips = []
+        if warp_mode in {"ipv4", "dual"}:
+            addresses.append(profile["ipv4_address"])
+            allowed_ips.append("0.0.0.0/0")
+        if warp_mode in {"ipv6", "dual"}:
+            addresses.append(profile["ipv6_address"])
+            allowed_ips.append("::/0")
+        singbox_config["endpoints"] = [{
+            "type": "wireguard", "tag": "warp-out", "system": False,
+            "mtu": min(max(int(profile.get("mtu", 1280)), 1280), 1420),
+            "address": addresses, "private_key": profile["private_key"],
+            "peers": [{
+                "address": profile["peer_address"], "port": int(profile["peer_port"]),
+                "public_key": profile["peer_public_key"], "allowed_ips": allowed_ips,
+                "persistent_keepalive_interval": 25,
+            }],
+        }]
+        strategy = "prefer_ipv4" if warp_mode != "ipv6" else "prefer_ipv6"
+        dns_server = "2606:4700:4700::1111" if warp_mode == "ipv6" else "1.1.1.1"
+        singbox_config["dns"] = {
+            "servers": [{"type": "udp", "tag": "warp-dns", "server": dns_server, "server_port": 53, "detour": "warp-out"}],
+            "final": "warp-dns", "strategy": strategy,
+        }
+        warp_inbounds = [f"in-{node['id']}" for node in valid_nodes if node.get("protocol") != "dokodemo-door"]
+        if warp_inbounds:
+            warp_rule = {"inbound": warp_inbounds, "action": "route", "outbound": "warp-out"}
+            if warp_mode == "ipv4": warp_rule["ip_version"] = 4
+            elif warp_mode == "ipv6": warp_rule["ip_version"] = 6
+            singbox_config["route"]["rules"].append(warp_rule)
+            if warp_mode == "ipv4": singbox_config["route"]["rules"].append({"inbound": warp_inbounds, "ip_version": 6, "action": "reject"})
+            elif warp_mode == "ipv6": singbox_config["route"]["rules"].append({"inbound": warp_inbounds, "ip_version": 4, "action": "reject"})
+        singbox_config["inbounds"].append({"type": "socks", "tag": "egress-check-in", "listen": "127.0.0.1", "listen_port": 39482})
+        check_rule = {"inbound": ["egress-check-in"], "action": "route", "outbound": "warp-out"}
+        singbox_config["route"]["rules"].append(check_rule)
+
     for node in valid_nodes:
-        ensure_firewall_open(node["port"])
+        ensure_firewall_open(node["port"], "udp" if node.get("protocol") in {"Hysteria2", "TUIC"} else "tcp")
     os.makedirs(os.path.dirname(SINGBOX_CONF_PATH), exist_ok=True)
     new_config_str = json.dumps(singbox_config, indent=2)
     old_config_str = ""
@@ -719,23 +974,46 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
         os.chmod(temp_config, 0o600)
         sing_box = shutil.which("sing-box")
         if not sing_box:
-            print("[agent] sing-box binary not found; keeping last known-good config", flush=True)
             os.remove(temp_config)
-            return
+            raise RuntimeError("sing-box binary not found")
         checked = subprocess.run([sing_box, "check", "-c", temp_config], capture_output=True, text=True, timeout=30)
         if checked.returncode != 0:
-            print(f"[agent] sing-box config rejected: {checked.stderr.strip()}", flush=True)
             os.remove(temp_config)
-            return
+            raise RuntimeError(f"sing-box config rejected: {checked.stderr.strip()[-500:]}")
+        backup_config = SINGBOX_CONF_PATH + ".last-good"
+        if old_config_str:
+            with open(backup_config + ".tmp", "w") as backup: backup.write(old_config_str)
+            os.chmod(backup_config + ".tmp", 0o600)
+            os.replace(backup_config + ".tmp", backup_config)
         os.replace(temp_config, SINGBOX_CONF_PATH)
         if os.path.exists("/sbin/openrc-run") or os.path.exists("/etc/alpine-release"):
-            subprocess.run(["rc-service", "sing-box", "restart"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            restarted = subprocess.run(["rc-service", "sing-box", "restart"], capture_output=True, text=True, timeout=30)
+            healthy = restarted.returncode == 0 and subprocess.run(["rc-service", "sing-box", "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15).returncode == 0
         else:
-            subprocess.run(["systemctl", "restart", "sing-box"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            restarted = subprocess.run(["systemctl", "restart", "sing-box"], capture_output=True, text=True, timeout=30)
+            healthy = restarted.returncode == 0 and subprocess.run(["systemctl", "is-active", "--quiet", "sing-box"], timeout=15).returncode == 0
+        if not healthy:
+            rollback_healthy = False
+            if old_config_str:
+                with open(SINGBOX_CONF_PATH + ".rollback", "w") as rollback: rollback.write(old_config_str)
+                os.chmod(SINGBOX_CONF_PATH + ".rollback", 0o600)
+                os.replace(SINGBOX_CONF_PATH + ".rollback", SINGBOX_CONF_PATH)
+                if os.path.exists("/etc/alpine-release"): subprocess.run(["rc-service", "sing-box", "restart"], timeout=30)
+                else: subprocess.run(["systemctl", "restart", "sing-box"], timeout=30)
+                rollback_healthy = _singbox_service_healthy()
+            raise RuntimeError(f"sing-box restart failed; rollback_healthy={str(rollback_healthy).lower()}")
     elif os.path.exists("/sbin/openrc-run") or os.path.exists("/etc/alpine-release"):
         subprocess.run(["rc-service", "sing-box", "start"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        if not _singbox_service_healthy(): raise RuntimeError("sing-box is not healthy after start")
     else:
         subprocess.run(["systemctl", "start", "sing-box"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        if not _singbox_service_healthy(): raise RuntimeError("sing-box is not healthy after start")
+    if socks5_outbound and socks5_outbound.get("source") == "residential": _verify_residential_exit()
+    if warp_mode != "off": _verify_warp_exit(warp_mode)
+    for filename in os.listdir("/opt/kui/"):
+        if (filename.startswith("cert_") or filename.startswith("key_")) and filename.endswith(".pem") and filename not in active_certs:
+            try: os.remove(os.path.join("/opt/kui/", filename))
+            except OSError: pass
 
 def report_status(current_nodes, argo_urls, force_http=False, allow_http=True):
     global last_reported_bytes, global_interval, fast_mode, dynamic_ping, pending_report_id, pending_report_bytes, pending_node_traffic, pending_report_payload, last_http_report
@@ -765,6 +1043,7 @@ def report_status(current_nodes, argo_urls, force_http=False, allow_http=True):
         pending_node_traffic = deltas
     status["node_traffic"] = pending_node_traffic
     status["report_id"] = pending_report_id
+    _write_json_state(TRAFFIC_STATE_PATH, {"last_reported_bytes": last_reported_bytes, "pending": {"report_id": pending_report_id, "report_bytes": pending_report_bytes, "node_traffic": pending_node_traffic, "payload": pending_report_payload}})
 
     websocket_sent = realtime_channel.send(status) if realtime_channel and realtime_channel.connected else False
     if websocket_sent and not force_http and time.time() - last_http_report < REALTIME_HTTP_INTERVAL:
@@ -778,6 +1057,7 @@ def report_status(current_nodes, argo_urls, force_http=False, allow_http=True):
         if pending_report_payload is None:
             pending_report_payload = dict(status)
             pending_report_payload["node_traffic"] = list(pending_node_traffic or [])
+            _write_json_state(TRAFFIC_STATE_PATH, {"last_reported_bytes": last_reported_bytes, "pending": {"report_id": pending_report_id, "report_bytes": pending_report_bytes, "node_traffic": pending_node_traffic, "payload": pending_report_payload}})
         req = urllib.request.Request(REPORT_URL, data=json.dumps(pending_report_payload).encode(), headers=HEADERS)
         with urllib.request.urlopen(req, timeout=5) as response:
             resp_data = json.loads(response.read().decode('utf-8'))
@@ -787,6 +1067,7 @@ def report_status(current_nodes, argo_urls, force_http=False, allow_http=True):
         pending_node_traffic = None
         pending_report_payload = None
         last_http_report = time.time()
+        _write_json_state(TRAFFIC_STATE_PATH, {"last_reported_bytes": last_reported_bytes, "pending": None})
         if resp_data and "interval" in resp_data:
             global_interval = min(max(1, int(resp_data["interval"])), 3600)
         new_fast_mode = bool(resp_data.get("fast_mode"))
@@ -898,6 +1179,7 @@ def fetch_and_apply_configs():
         if data.get("success"):
             persist_agent_token(data.get("agent_token"))
             new_realtime_url = data.get("realtime_url") or ""
+            if new_realtime_url: new_realtime_url = _require_https_url(new_realtime_url, "realtime_url")
             if new_realtime_url and new_realtime_url != REALTIME_URL:
                 REALTIME_URL = new_realtime_url
                 env["realtime_url"] = new_realtime_url
@@ -911,23 +1193,76 @@ def fetch_and_apply_configs():
                 realtime_channel.start()
             nodes = data.get("configs", [])
             global current_proxy_config
-            pc = fetch_proxy_config()
-            current_proxy_config = pc if pc is not None else data.get("proxy", {})
-            mesh = _extract_mesh(current_proxy_config)
+            current_proxy_config = {}
+            mesh = {"enabled": False}
             peers = []
             if mesh.get("enabled"):
                 peers = fetch_proxy_mesh(mesh.get("country", "ANY"))
                 exit_ip = mesh.get("exit")
                 if exit_ip and exit_ip != "ANY":
                     peers = [p for p in peers if p.get("country") == exit_ip or p.get("socks_ip") == exit_ip or p.get("ip") == exit_ip]
-            socks5_outbound = data.get("socks5_outbound", {})
+            egress = data.get("egress", {})
+            desired_egress = egress.get("desired_mode", "native")
+            revision = int(egress.get("revision", 0))
+            local_warp = _load_warp_state()
+            if local_warp.get("pending_result"):
+                try:
+                    ack = _post_warp_result(local_warp["pending_result"])
+                    if (local_warp["pending_result"].get("success") is True and ack.get("accepted")) or revision != int(local_warp["pending_result"].get("revision", -1)):
+                        _save_warp_state(local_warp["applied_mode"], local_warp["applied_revision"])
+                except Exception:
+                    pass
+                retry_after = int(local_warp["pending_result"].get("retry_after", 0))
+                if local_warp["pending_result"].get("success") is False and retry_after > time.time():
+                    _schedule_egress_retry(retry_after - time.time())
+            remote_applied_revision = int(egress.get("applied_revision", 0))
+            applied_revision = max(remote_applied_revision, local_warp["applied_revision"])
+            applied_egress = local_warp["applied_mode"] if local_warp["applied_revision"] > remote_applied_revision else egress.get("applied_mode", local_warp["applied_mode"])
+            apply_egress_change = revision > applied_revision
+            pending_failure = local_warp.get("pending_result") or {}
+            if apply_egress_change and pending_failure.get("success") is False and int(pending_failure.get("revision", -1)) == revision:
+                retry_after = int(pending_failure.get("retry_after", 0))
+                if time.time() < retry_after: apply_egress_change = False
+            runtime_egress = desired_egress if apply_egress_change else applied_egress
+            residential = data.get("residential_outbound", {})
+            runtime_socks = {"enabled": True, "source": "residential", "addr": residential.get("addr", "127.0.0.1"), "port": residential.get("port", 7920), "user": residential.get("user", ""), "pass": residential.get("pass", ""), "mode": "global", "domains": ""} if runtime_egress == "residential" else {}
+            runtime_warp = runtime_egress[5:] if runtime_egress.startswith("warp_") else "off"
+            config_hash = hashlib.sha256(json.dumps({"nodes": nodes, "egress": runtime_egress}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
             try:
-                build_singbox_config(nodes, current_proxy_config, peers, mesh, socks5_outbound)
-                if realtime_channel and realtime_channel.connected:
-                    realtime_channel.send({"success": True, "applied_at": int(time.time() * 1000)}, "config.result")
+                if runtime_egress == "residential" and not residential.get("available"): raise RuntimeError("residential proxy is unavailable")
+                build_singbox_config(nodes, current_proxy_config, peers, mesh, runtime_socks, runtime_warp)
+                if apply_egress_change:
+                    result = {"success": True, "component": "egress", "revision": revision, "desired_mode": desired_egress, "applied_mode": desired_egress, "rolled_back": False, "rollback_healthy": True, "applied_at": int(time.time() * 1000)}
+                    _save_warp_state(desired_egress, revision, result)
+                    try:
+                        ack = _post_warp_result(result)
+                        if ack.get("accepted"): _save_warp_state(desired_egress, revision)
+                    except Exception: pass
+                    if realtime_channel and realtime_channel.connected: realtime_channel.send(result, "config.result")
+                elif realtime_channel and realtime_channel.connected:
+                    realtime_channel.send({"success": True, "component": "config", "config_hash": config_hash, "old_config_active": False, "rollback_healthy": True, "applied_at": int(time.time() * 1000)}, "config.result")
             except Exception as error:
-                if realtime_channel and realtime_channel.connected:
-                    realtime_channel.send({"success": False, "error": str(error)[:500], "applied_at": int(time.time() * 1000)}, "config.result")
+                if apply_egress_change:
+                    rollback_healthy = False
+                    try:
+                        rollback_socks = {"enabled": True, "source": "residential", "addr": residential.get("addr", "127.0.0.1"), "port": residential.get("port", 7920), "user": residential.get("user", ""), "pass": residential.get("pass", ""), "mode": "global", "domains": ""} if applied_egress == "residential" else {}
+                        rollback_warp = applied_egress[5:] if applied_egress.startswith("warp_") else "off"
+                        build_singbox_config(nodes, current_proxy_config, peers, mesh, rollback_socks, rollback_warp)
+                        rollback_healthy = _singbox_service_healthy()
+                    except Exception:
+                        rollback_healthy = False
+                    retries = int(pending_failure.get("retries", 0)) + 1
+                    retry_delay = min(300, 30 * (2 ** min(retries - 1, 4)))
+                    result = {"success": False, "component": "egress", "revision": revision, "desired_mode": desired_egress, "applied_mode": applied_egress, "rolled_back": rollback_healthy, "rollback_healthy": rollback_healthy, "error": str(error)[:500], "retries": retries, "retry_after": int(time.time() + retry_delay), "applied_at": int(time.time() * 1000)}
+                    _save_warp_state(applied_egress, applied_revision, result)
+                    _schedule_egress_retry(retry_delay)
+                    try:
+                        ack = _post_warp_result(result)
+                        if not ack.get("accepted"): pass
+                    except Exception: pass
+                    if realtime_channel and realtime_channel.connected: realtime_channel.send(result, "config.result")
+                elif realtime_channel and realtime_channel.connected:
+                    realtime_channel.send({"success": False, "component": "config", "config_hash": config_hash, "error": str(error)[:500], "old_config_active": _singbox_service_healthy(), "rollback_healthy": _singbox_service_healthy(), "applied_at": int(time.time() * 1000)}, "config.result")
                 raise
             return nodes
     except Exception as error:
@@ -970,6 +1305,8 @@ if __name__ == "__main__":
 
     time.sleep(2)
     threading.Thread(target=heartbeat_loop, name="kui-heartbeat", daemon=True).start()
+    try: os.remove("/opt/kui/.update-pending")
+    except FileNotFoundError: pass
     while True:
         config_wakeup.clear()
         while realtime_channel and realtime_channel.enabled and not realtime_channel.connected:

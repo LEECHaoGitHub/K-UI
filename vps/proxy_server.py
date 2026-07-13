@@ -22,12 +22,16 @@ def set_credentials(user: str, passwd: str) -> None:
     PROXY_USER = user.encode()
     PROXY_PASS = passwd.encode()
 
+def set_enabled(enabled: bool) -> None:
+    if not enabled: set_credentials("", "")
+
 PROXY_USER = _PROXY_USER.encode()
 PROXY_PASS = _PROXY_PASS.encode()
 
 # 全局软开关：由 lite_manager 动态更新，实现秒切
 ACTIVE_BIND = "tun_main"
 MAX_CONNECTIONS = max(16, int(os.environ.get("PROXY_MAX_CONNECTIONS", "256")))
+RELAY_IDLE_TIMEOUT = max(60, int(os.environ.get("PROXY_IDLE_TIMEOUT", "600")))
 CONNECTION_SLOTS = threading.BoundedSemaphore(MAX_CONNECTIONS)
 
 def parse_int(value: Any) -> int:
@@ -92,6 +96,7 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
                 except OSError:
                     continue
             sock.connect(sa)
+            sock.settimeout(None)
             return sock
         except OSError as e:
             err = e
@@ -157,6 +162,8 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
         port = int.from_bytes(recv_exact(client, 2), "big")
         
         upstream = create_connection((host, port), timeout=20)
+        client.settimeout(None)
+        upstream.settimeout(RELAY_IDLE_TIMEOUT); client.settimeout(RELAY_IDLE_TIMEOUT)
         client.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
         relay(client, upstream)
     except: pass
@@ -197,6 +204,8 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
                 return
             host, port = parsed
             upstream = create_connection((host, port), timeout=20)
+            client.settimeout(None)
+            upstream.settimeout(RELAY_IDLE_TIMEOUT); client.settimeout(RELAY_IDLE_TIMEOUT)
             client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             if rest: upstream.sendall(rest)
             relay(client, upstream)
@@ -208,6 +217,8 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         headers = [line for line in lines[1:] if not line.lower().startswith(("proxy-connection:", "connection:", "proxy-authorization:"))]
         request = f"{method} {path} {version}\r\n" + "\r\n".join(headers) + "\r\nConnection: close\r\n\r\n"
         upstream = create_connection((parsed.hostname, port), timeout=20)
+        client.settimeout(None)
+        upstream.settimeout(RELAY_IDLE_TIMEOUT); client.settimeout(RELAY_IDLE_TIMEOUT)
         upstream.sendall(request.encode("iso-8859-1") + rest)
         relay(client, upstream)
     except: pass

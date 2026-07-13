@@ -35,7 +35,8 @@ class RealtimeChannel:
 
     @property
     def enabled(self):
-        return bool(websocket and self.base_url and self.ip and self.token)
+        parsed = urllib.parse.urlsplit(self.base_url)
+        return bool(websocket and parsed.scheme == "https" and parsed.hostname and not parsed.username and not parsed.password and self.ip and self.token)
 
     def start(self):
         if not self.enabled or (self._thread and self._thread.is_alive()):
@@ -80,7 +81,9 @@ class RealtimeChannel:
                 return False
 
     def _websocket_url(self):
-        scheme = "wss" if self.base_url.startswith("https://") else "ws"
+        if not self.enabled:
+            raise ValueError("realtime URL must use HTTPS")
+        scheme = "wss"
         base = self.base_url.split("://", 1)[-1]
         query = urllib.parse.urlencode({"ip": self.ip, "role": self.role})
         return f"{scheme}://{base}/agent/ws?{query}"

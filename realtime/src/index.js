@@ -35,6 +35,14 @@ function sanitizeSnapshot(snapshot) {
   };
 }
 
+function compactRoleState(role, data) {
+  if (role === "core") {
+    const keys = ["cpu", "mem", "disk", "load", "uptime", "net_in_speed", "net_out_speed", "tcp_conn", "udp_conn", "os", "arch"];
+    return Object.fromEntries(keys.filter(key => data?.[key] !== undefined).map(key => [key, data[key]]));
+  }
+  return { details: Array.isArray(data?.details) ? data.details.slice(0, 4).map(item => ({ tunnel: item.tunnel, active: item.active, node_ip: item.node_ip, exit_ip: item.exit_ip, country: item.country, ready: item.ready })) : [] };
+}
+
 async function verifyAdmin(header, env) {
   try {
     if (!header || !env.PAGES_ORIGIN) return false;
@@ -162,7 +170,7 @@ export class VpsPresence extends DurableObject {
       }
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
-      server.serializeAttachment({ ip, role, connected_at: Date.now(), bootId: "", lastSeq: -1, lastSeen: 0 });
+      server.serializeAttachment({ ip, role, connected_at: Date.now(), bootId: "", lastSeq: -1, lastSeen: 0, state: null });
       this.ctx.acceptWebSocket(server, [role]);
       const hub = this.env.DASHBOARD_HUB.get(this.env.DASHBOARD_HUB.idFromName("main"));
       try {
@@ -208,6 +216,7 @@ export class VpsPresence extends DurableObject {
       attachment.bootId = bootId;
       attachment.lastSeq = -1;
     }
+    if (this.bootId[role] === bootId && sequence <= Number(this.lastSeq[role] ?? -1)) return;
     if (sequence <= Number(attachment.lastSeq ?? -1)) return;
     attachment.lastSeq = sequence;
     this.bootId[role] = bootId;
@@ -229,6 +238,7 @@ export class VpsPresence extends DurableObject {
     const nextRoleState = envelope.data || {};
     const criticalChange = !previousRoleState || (role === "proxy" && JSON.stringify((previousRoleState.details || []).map(item => [item.tunnel, item.active, item.node_ip])) !== JSON.stringify((nextRoleState.details || []).map(item => [item.tunnel, item.active, item.node_ip])));
     attachment.lastSeen = Date.now();
+    attachment.state = compactRoleState(role, nextRoleState);
     ws.serializeAttachment(attachment);
     this.snapshot.ip = attachment.ip;
     this.snapshot[role] = nextRoleState;
@@ -266,8 +276,8 @@ export class VpsPresence extends DurableObject {
     const proxyAge = this.snapshot.proxy_last_seen ? now - this.snapshot.proxy_last_seen : null;
     return {
       ...this.snapshot,
-      core_state: !this.snapshot.core_connected ? "offline" : coreAge > 20000 ? "stale" : "online",
-      proxy_state: !this.snapshot.proxy_connected ? "offline" : proxyAge > 20000 ? "stale" : "online",
+      core_state: !this.snapshot.core_connected ? "offline" : coreAge === null || coreAge > 20000 ? "stale" : "online",
+      proxy_state: !this.snapshot.proxy_connected ? "offline" : proxyAge === null || proxyAge > 20000 ? "stale" : "online",
       core_age: coreAge,
       proxy_age: proxyAge,
       boot_id: this.bootId,
@@ -282,6 +292,7 @@ export class VpsPresence extends DurableObject {
       this.snapshot[`${role}_connected`] = !!socket;
       if (!attachment) continue;
       this.snapshot.ip = attachment.ip || this.snapshot.ip;
+      if (attachment.state) this.snapshot[role] = { ...(this.snapshot[role] || {}), ...attachment.state };
       if (attachment.lastSeen) this.snapshot[`${role}_last_seen`] = attachment.lastSeen;
       this.bootId[role] = attachment.bootId || this.bootId[role];
       this.lastSeq[role] = Number(attachment.lastSeq ?? this.lastSeq[role]);
@@ -326,6 +337,8 @@ export class DashboardHub extends DurableObject {
     this.env = env;
     try { ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong")); } catch {}
     this.activityUntil = 0;
+    this.publicPolicyAllowed = false;
+    this.publicPolicyCheckedAt = 0;
   }
 
   async fetch(request) {
@@ -384,7 +397,8 @@ export class DashboardHub extends DurableObject {
         try { ws.send(payload); } catch {}
       }
       const publicSnapshot = sanitizeSnapshot(snapshot);
-      if (publicSnapshot) {
+      const publicSockets = this.ctx.getWebSockets("public");
+      if (publicSnapshot && publicSockets.length && await this.publicPolicyEnabled()) {
         const publicPayload = JSON.stringify({ type: "patch", data: publicSnapshot, ts: Date.now() });
         for (const ws of this.ctx.getWebSockets("public")) {
           try { ws.send(publicPayload); } catch {}
@@ -414,10 +428,10 @@ export class DashboardHub extends DurableObject {
         transport: "http",
         core: { cpu: row.cpu, mem: row.mem, disk: row.disk, load: row.load, uptime: row.uptime, net_in_speed: row.net_in_speed, net_out_speed: row.net_out_speed, tcp_conn: row.tcp_conn, udp_conn: row.udp_conn },
         core_last_seen: row.last_report || 0,
-        core_state: Date.now() - (row.last_report || 0) < 1200000 ? "online" : "offline",
+        core_state: Date.now() - (row.last_report || 0) < 360000 ? "online" : Date.now() - (row.last_report || 0) < 1200000 ? "stale" : "offline",
         proxy: proxy ? { details } : null,
         proxy_last_seen: proxy?.last_seen || 0,
-        proxy_state: proxy && Date.now() - proxy.last_seen < 1200000 ? "online" : "offline",
+        proxy_state: proxy && Date.now() - proxy.last_seen < 360000 ? "online" : proxy && Date.now() - proxy.last_seen < 1200000 ? "stale" : "offline",
         updated_at: Math.max(row.last_report || 0, proxy?.last_seen || 0),
       };
     }));
@@ -465,6 +479,17 @@ export class DashboardHub extends DurableObject {
       const presence = this.env.VPS_PRESENCE.get(this.env.VPS_PRESENCE.idFromName(ip));
       return presence.fetch(new Request("https://presence.internal/dashboard-active", { method: "POST", headers: { "X-KUI-Active": active ? "1" : "0", "X-KUI-Until": String(until) } }));
     }));
+  }
+
+  async publicPolicyEnabled() {
+    if (Date.now() - this.publicPolicyCheckedAt < 5000) return this.publicPolicyAllowed;
+    const setting = await this.env.DB.prepare("SELECT value FROM probe_settings WHERE key = 'is_public'").first();
+    this.publicPolicyAllowed = !setting || setting.value === "true";
+    this.publicPolicyCheckedAt = Date.now();
+    if (!this.publicPolicyAllowed) {
+      for (const ws of this.ctx.getWebSockets("public")) { try { ws.close(1008, "private dashboard"); } catch {} }
+    }
+    return this.publicPolicyAllowed;
   }
 
   async alarm() {

@@ -452,35 +452,23 @@
                                 <button @click="addNode(vps.ip)" class="w-full bg-gradient-to-r from-slate-800 to-black text-white py-3 rounded-xl font-bold shadow-lg transition-all hover:scale-[1.02]">添加单节点</button>
                             </div>
 
-                            <div class="bg-slate-100/50 p-4 rounded-[1.5rem] border border-slate-200 mt-4">
-                                <div class="flex items-center justify-between mb-3">
-                                    <div class="flex items-center gap-2">
-                                        <span :class="vps.socks5_enable == 1 ? 'bg-emerald-500' : 'bg-slate-300'" class="w-2 h-2 rounded-full inline-block"></span>
-                                        <span class="text-xs font-bold text-slate-500 uppercase tracking-wider">SOCKS5 出站代理</span>
-                                    </div>
-                                    <label class="flex items-center gap-1 text-sm"><input type="checkbox" :checked="vps.socks5_enable == 1" @change="updateVpsSocks5(vps.ip, 'socks5_enable', $event.target.checked ? 1 : 0); vps.socks5_enable = $event.target.checked ? 1 : 0" class="w-4 h-4 accent-indigo-600"> 启用</label>
-                                </div>
-                                <div v-if="vps.socks5_enable == 1" class="space-y-3">
-                                    <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
-                                        <div><label class="block text-[10px] font-bold text-slate-400 mb-1">地址</label><input :value="vps.socks5_addr" @change="updateVpsSocks5(vps.ip, 'socks5_addr', $event.target.value)" placeholder="SOCKS5 地址" class="w-full bg-white border p-2.5 rounded-xl text-sm outline-none"></div>
-                                        <div><label class="block text-[10px] font-bold text-slate-400 mb-1">端口</label><input :value="vps.socks5_port" @change="updateVpsSocks5(vps.ip, 'socks5_port', parseInt($event.target.value)||0)" type="number" placeholder="1080" class="w-full bg-white border p-2.5 rounded-xl text-sm outline-none"></div>
-                                        <div><label class="block text-[10px] font-bold text-slate-400 mb-1">用户名</label><input :value="vps.socks5_user" @change="updateVpsSocks5(vps.ip, 'socks5_user', $event.target.value)" placeholder="可选" class="w-full bg-white border p-2.5 rounded-xl text-sm outline-none"></div>
-                                        <div><label class="block text-[10px] font-bold text-slate-400 mb-1">密码</label><input :value="vps.socks5_pass" @change="updateVpsSocks5(vps.ip, 'socks5_pass', $event.target.value)" type="password" placeholder="可选" class="w-full bg-white border p-2.5 rounded-xl text-sm outline-none"></div>
-                                    </div>
-                                    <div class="flex items-center gap-3 pt-1">
-                                        <label class="flex items-center gap-2 text-xs font-bold text-slate-500"><input type="radio" :value="'global'" :checked="(vps.socks5_mode||'global')=='global'" @change="updateVpsSocks5(vps.ip, 'socks5_mode', 'global'); vps.socks5_mode='global'" class="accent-indigo-600"> 全局出站</label>
-                                        <label class="flex items-center gap-2 text-xs font-bold text-slate-500"><input type="radio" :value="'selective'" :checked="(vps.socks5_mode||'global')=='selective'" @change="updateVpsSocks5(vps.ip, 'socks5_mode', 'selective'); vps.socks5_mode='selective'" class="accent-indigo-600"> 局部代理</label>
-                                    </div>
-                                    <div v-if="(vps.socks5_mode||'global')=='selective'" class="bg-white/60 border border-slate-200 p-3 rounded-xl">
-                                        <div class="text-xs font-bold text-slate-500 mb-2">选择需走 SOCKS5 代理的分类：</div>
-                                        <div class="flex flex-wrap gap-3">
-                                            <label v-for="cat in socks5Categories" :key="cat.key" class="flex items-center gap-1.5 text-xs font-medium text-slate-600 cursor-pointer">
-                                                <input type="checkbox" :checked="socks5CatSelected(vps, cat.key)" @change="toggleSocks5Cat(vps, cat.key, $event.target.checked)" class="w-3.5 h-3.5 accent-indigo-600"> {{ cat.label }}
-                                            </label>
-                                        </div>
-                                    </div>
+                            <div class="bg-sky-50/70 p-4 rounded-[1.5rem] border border-sky-100 mt-4">
+                                <div class="mb-3"><div class="text-xs font-black text-sky-700 tracking-wider">节点出口</div><div class="text-[10px] text-sky-500/80 mt-0.5">手动下拉选择；系统保证 SOCKS5 与 WARP 不会同时启用</div></div>
+                                <select :value="egressModeOf(vps)" @change="updateVpsEgress(vps, $event.target.value)" :disabled="vps.egress_status === 'pending'" class="w-full bg-white border border-sky-200 p-3 rounded-xl text-sm font-black text-slate-700 outline-none disabled:opacity-50">
+                                    <option value="native">原生出口</option>
+                                    <option value="warp_ipv4">WARP IPv4</option>
+                                    <option value="warp_ipv6">WARP IPv6</option>
+                                    <option value="warp_dual">WARP 双栈</option>
+                                    <option value="residential">住宅 IP 代理</option>
+                                </select>
+                                <div class="mt-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[10px] font-black text-amber-700">⚠ 住宅 IP 出口与 WARP 出口不能同时启用；住宅出口自动使用本机 ACTIVE 隧道，无需填写地址或密码。</div>
+                                <div class="mt-3 text-[10px] font-bold" :class="vps.egress_status === 'pending' ? 'text-amber-500' : (vps.egress_status === 'failed' ? 'text-rose-500' : 'text-slate-500')">
+                                    <span v-if="vps.egress_status === 'pending'">● 期望 {{ egressModeLabel(vps.egress_mode) }}，正在实时下发...</span>
+                                    <span v-else-if="vps.egress_status === 'applied'">● 实际已应用 {{ egressModeLabel(vps.egress_applied_mode) }}</span>
+                                    <span v-else-if="vps.egress_status === 'failed'">● 应用失败；实际保持 {{ egressModeLabel(vps.egress_applied_mode) }}：{{ vps.egress_error || '未知错误' }}</span>
                                 </div>
                             </div>
+
                         </div>
 
                         <div class="p-6 md:p-8 bg-slate-50/50 border-t border-white flex-1">
@@ -491,7 +479,7 @@
                                         <div v-if="node.protocol === 'VLESS-Argo'" class="text-[11px] p-1.5 rounded-lg overflow-hidden text-ellipsis whitespace-nowrap max-w-full inline-block" :class="node.sni.includes('等待') ? 'bg-amber-50 text-amber-600 animate-pulse font-bold' : 'bg-emerald-50 border border-emerald-100 text-emerald-700 font-mono font-bold'">Argo: {{ node.sni }}</div>
                                         <div v-else-if="node.sni" class="text-[11px] bg-slate-50 text-slate-500 p-1.5 rounded-lg overflow-hidden text-ellipsis font-mono inline-block">SNI: {{ node.sni }}</div>
                                     </div>
-                                    <div class="flex gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity"><button @click="toggleNode(node.id, node.enable === 1 ? 0 : 1)" class="text-[11px] px-2 py-1 rounded-md bg-white border border-slate-200 hover:bg-slate-50 font-bold text-slate-600 shadow-sm">{{ node.enable === 1 ? '停用' : '启用' }}</button><button @click="deleteNode(node.id)" class="text-rose-500 text-[11px] px-2 py-1 bg-white border border-rose-100 rounded-md hover:bg-rose-50 font-bold shadow-sm">删除</button></div>
+                                    <div class="flex gap-1.5 opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity"><button @click="toggleNode(node.id, node.enable === 1 ? 0 : 1)" class="text-[11px] px-2 py-1 rounded-md bg-white border border-slate-200 hover:bg-slate-50 font-bold text-slate-600 shadow-sm">{{ node.enable === 1 ? '停用' : '启用' }}</button><button @click="deleteNode(node.id)" class="text-rose-500 text-[11px] px-2 py-1 bg-white border border-rose-100 rounded-md hover:bg-rose-50 font-bold shadow-sm">删除</button></div>
                                 </div>
                                 <div class="w-full bg-slate-100 rounded-full h-1.5 mt-2 overflow-hidden"><div :class="(node.traffic_limit > 0 && node.traffic_used >= node.traffic_limit) ? 'bg-rose-400' : 'bg-slate-800'" class="h-1.5 rounded-full transition-all duration-500" :style="{ width: getTrafficPercent(node.traffic_used, node.traffic_limit) + '%' }"></div></div>
                                 <div class="flex justify-between text-[10px] text-slate-400 mt-2 font-medium"><span>已用: {{ formatBytes(node.traffic_used) }} <span v-if="node.traffic_limit > 0">/ {{ formatBytes(node.traffic_limit) }}</span></span><div class="flex gap-3"><span v-if="node.expire_time > 0">到期: {{ formatDate(node.expire_time) }}</span><button v-if="node.traffic_used > 0" @click="resetTraffic(node.id)" class="text-indigo-500 hover:underline font-bold">清零</button></div></div>
@@ -1100,10 +1088,13 @@
 
                 const probeCountryStats = computed(() => { const stats = {}; publicProbeServers.value.forEach(s => { let code = (s.country || 'xx').toUpperCase(); if(code === 'TW') code = 'CN'; if(code !== 'XX') stats[code] = (stats[code] || 0) + 1; }); return stats; });
 
+                let authGeneration = 0;
                 const fetchApi = async (url, options = {}) => {
-                    const timestamp = Date.now().toString(); const signature = await generateHMAC(authKey.value, currentUser.value + timestamp);
-                    options.headers = { ...options.headers, 'Authorization': `${btoa(currentUser.value)}.${timestamp}.${signature}` };
+                    const generation = authGeneration; const requestUser = currentUser.value; const requestKey = authKey.value;
+                    const timestamp = Date.now().toString(); const signature = await generateHMAC(requestKey, requestUser + timestamp);
+                    options.headers = { ...options.headers, 'Authorization': `${btoa(requestUser)}.${timestamp}.${signature}` };
                     const res = await fetch(url, options);
+                    if (generation !== authGeneration || requestUser !== currentUser.value) throw new Error('Stale session response');
                     if (res.status === 401) { logout(); throw new Error('Unauthorized'); }
                     if (!res.ok) {
                         const raw = await res.text();
@@ -1133,6 +1124,7 @@
                         const hashedPass = await sha256(password.value); const timestamp = Date.now().toString(); const sig = await generateHMAC(hashedPass, loginUser.value + timestamp);
                         const res = await fetch('/api/login', { method: 'POST', headers: { 'Authorization': `${btoa(loginUser.value)}.${timestamp}.${sig}` } });
                         if (res.ok) {
+                            authGeneration++;
                             const data = await res.json(); authKey.value = hashedPass; currentUser.value = loginUser.value; role.value = data.role;
                             localStorage.setItem('kui_auth_key', authKey.value); localStorage.setItem('kui_user', currentUser.value); localStorage.setItem('kui_role', role.value);
                             isLoggedIn.value = true; showLoginModal.value = false; password.value = ''; const publicSocket = publicRealtimeSocket; publicRealtimeSocket = null; publicSocket?.close(); clearTimeout(publicRealtimeReconnectTimer); clearTimeout(publicRealtimeFallbackTimer); clearInterval(publicRealtimeActivityTimer);
@@ -1142,7 +1134,8 @@
                     } catch (e) { alert('登录异常'); }
                 };
                 
-                const logout = () => { localStorage.removeItem('kui_auth_key'); localStorage.removeItem('kui_user'); localStorage.removeItem('kui_role'); isLoggedIn.value = false; currentUser.value = ''; authKey.value = ''; activeTab.value = 'probe'; realtimeGeneration++; realtimeDisconnectedAt = 0; clearTimeout(realtimeFallbackTimer); clearTimeout(realtimeReconnectTimer); clearTimeout(realtimeConnectTimer); clearInterval(realtimePingTimer); const socket = realtimeSocket; realtimeSocket = null; socket?.close(); realtimeConnected.value = false; window.kuiRealtimeConnected = false; stopPolling(); startProbePolling();};
+                const clearPrivateState = () => { servers.value = []; nodes.value = []; users.value = []; adminProbeServers.value = []; mySubToken.value = ''; probeDetailId.value = null; probeDetail.value = {}; window.kuiRealtimeProxySnapshots = {}; };
+                const logout = () => { authGeneration++; localStorage.removeItem('kui_auth_key'); localStorage.removeItem('kui_user'); localStorage.removeItem('kui_role'); isLoggedIn.value = false; currentUser.value = ''; authKey.value = ''; clearPrivateState(); activeTab.value = 'probe'; realtimeGeneration++; realtimeDisconnectedAt = 0; clearTimeout(realtimeFallbackTimer); clearTimeout(realtimeReconnectTimer); clearTimeout(realtimeConnectTimer); clearInterval(realtimePingTimer); const socket = realtimeSocket; realtimeSocket = null; socket?.close(); realtimeConnected.value = false; window.kuiRealtimeConnected = false; stopPolling(); startProbePolling();};
                 const sendUiPing = async () => { try { await fetchApi('/api/ui_ping', { method: 'POST' }); } catch(e) {} };
 
                 let mapInitialized = false; let myMap = null; let markersLayer = null; let geoJsonLayer = null; let worldGeoJson = null; let currentMapDataStr = "";
@@ -1266,17 +1259,10 @@
                 let isFetchingKUI = false;
                 const refreshData = async () => {
                     if (isFetchingKUI) return; isFetchingKUI = true;
-                    const socks5Snapshot = {};
-                    for (const s of servers.value) {
-                        if (s.socks5_enable == 1) socks5Snapshot[s.ip] = { socks5_addr: s.socks5_addr, socks5_port: s.socks5_port, socks5_user: s.socks5_user, socks5_pass: s.socks5_pass, socks5_mode: s.socks5_mode, socks5_domains: s.socks5_domains };
-                    }
                     try {
                         const res = await fetchApi('/api/data'); const data = await res.json();
                         const liveByIp = new Map(servers.value.filter(item => item._realtime_ts).map(item => [normalizeRealtimeKey(item.ip), item]));
                         servers.value = (data.servers || []).map(item => { const live = liveByIp.get(normalizeRealtimeKey(item.ip)); return live && live._realtime_ts > Number(item.last_report || 0) ? { ...item, ...live } : item; }); nodes.value = data.nodes || []; users.value = data.users || [];
-                        for (const s of servers.value) {
-                            if (socks5Snapshot[s.ip]) Object.assign(s, socks5Snapshot[s.ip]);
-                        }
                         if (data.siteTitle) { siteTitle.value = data.siteTitle; siteTitleInput.value = data.siteTitle; }
                         if (data.mySubToken) mySubToken.value = data.mySubToken;
                         if (data.realtimeUrl && data.realtimeUrl !== realtimeUrl.value) { realtimeUrl.value = data.realtimeUrl; connectRealtime(); }
@@ -1309,27 +1295,22 @@
 
                 const generateUUIDForNewUser = () => { newUser.password = crypto.randomUUID(); };
                 const expiryTimestamp = (date) => date ? new Date(`${date}T23:59:59.999`).getTime() : 0;
-                const addUser = async () => { if (!newUser.username || !newUser.password) return alert('请输入用户名和密码！'); const limit = newUser.traffic_limit_gb ? Math.floor(parseFloat(newUser.traffic_limit_gb) * 1073741824) : 0; const expire = expiryTimestamp(newUser.expire_date); await fetchApi('/api/users', { method: 'POST', body: JSON.stringify({ ...newUser, traffic_limit: limit, expire_time: expire }) }); Object.assign(newUser, { username: '', password: '', traffic_limit_gb: '', expire_date: '' }); refreshData(); };
+                const addUser = async () => { const username = String(newUser.username || '').trim(); if (!/^[A-Za-z0-9_.-]{1,64}$/.test(username) || username === loginUser.value || username.toLowerCase() === 'admin') return alert('用户名仅允许字母、数字、点、横线和下划线，且不能使用管理员名'); if (!newUser.password || newUser.password.length < 8) return alert('密码至少 8 位'); const limit = newUser.traffic_limit_gb ? Math.floor(parseFloat(newUser.traffic_limit_gb) * 1073741824) : 0; const expire = expiryTimestamp(newUser.expire_date); await fetchApi('/api/users', { method: 'POST', body: JSON.stringify({ ...newUser, username, traffic_limit: limit, expire_time: expire }) }); Object.assign(newUser, { username: '', password: '', traffic_limit_gb: '', expire_date: '' }); refreshData(); };
                 const toggleUser = async (username, status) => { await fetchApi('/api/users', { method: 'PUT', body: JSON.stringify({ username, enable: status }) }); refreshData(); };
                 const deleteUser = async (username) => { if(confirm('⚠️ 确定删除用户？节点将归还给管理员。')) { await fetchApi(`/api/users?username=${username}`, { method: 'DELETE' }); refreshData(); } };
                 const resetUserTraffic = async (username) => { await fetchApi('/api/users', { method: 'PUT', body: JSON.stringify({ username, reset_traffic: true }) }); refreshData(); };
                 const addVps = async () => { if(!newVps.value.ip || !newVps.value.name) return alert('请输入名称和IP'); deployOsMap[newVps.value.ip] = newVps.value.os; saveOsMap(); await fetchApi('/api/vps', { method: 'POST', body: JSON.stringify({ ip: newVps.value.ip, name: newVps.value.name }) }); newVps.value = { name: '', ip: '', os: 'debian' }; refreshData(); fetchProbeData();};
                 const deleteVps = async (ip) => { if(confirm('🧨 确定移除该机器？该机器相关的探针数据、节点数据将被完全清空！')) { await fetchApi(`/api/vps?ip=${ip}`, { method: 'DELETE' }); refreshData(); fetchProbeData();} };
-                const updateVpsSocks5 = async (ip, field, value) => {
-                    const svr = servers.value.find(s => s.ip === ip);
-                    if (svr) svr[field] = value;
-                    await fetchApi('/api/vps', { method: 'PUT', body: JSON.stringify({ ip, [field]: value }) });
-                };
-                const socks5Categories = Object.freeze([{ key: 'youtube', label: '🌐 YouTube' }, { key: 'ai', label: '🤖 AI' }, { key: 'google', label: '🔍 谷歌搜索' }, { key: 'streaming', label: '🎬 流媒体' }]);
-                const socks5CatSelected = (vps, cat) => { try { const d = JSON.parse(vps.socks5_domains || '{}'); return Array.isArray(d.categories) && d.categories.includes(cat); } catch(e) { return false; } };
-                const toggleSocks5Cat = (vps, cat, on) => {
-                    let d = { categories: [] };
-                    try { d = JSON.parse(vps.socks5_domains || '{}'); if (!Array.isArray(d.categories)) d.categories = []; } catch(e) { d = { categories: [] }; }
-                    if (on) { if (!d.categories.includes(cat)) d.categories.push(cat); } else { d.categories = d.categories.filter(c => c !== cat); }
-                    const raw = JSON.stringify(d);
-                    const svr = servers.value.find(s => s.ip === vps.ip);
-                    if (svr) svr.socks5_domains = raw;
-                    fetchApi('/api/vps', { method: 'PUT', body: JSON.stringify({ ip: vps.ip, socks5_domains: raw }) });
+                const egressModeLabel = mode => ({ native: '原生出口', residential: '住宅 IP 代理', warp_ipv4: 'WARP IPv4', warp_ipv6: 'WARP IPv6', warp_dual: 'WARP 双栈' }[mode] || mode);
+                const egressModeOf = vps => vps.egress_mode || 'native';
+                const updateVpsEgress = async (vps, mode) => {
+                    if (vps.egress_status === 'pending') return;
+                    const previous = egressModeOf(vps); vps.egress_status = 'pending';
+                    try {
+                        const res = await fetchApi('/api/vps', { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ ip: vps.ip, egress_mode: mode }) });
+                        const saved = await res.json();
+                        vps.egress_mode = saved.egress_mode || mode; vps.egress_revision = saved.egress_revision; vps.egress_status = saved.egress_status || 'pending';
+                    } catch (error) { vps.egress_mode = previous; vps.egress_status = 'failed'; alert(error.message || `出口切换失败，仍保持 ${egressModeLabel(previous)}`); }
                 };
 
                 const addNode = async (ip) => {
@@ -1341,16 +1322,17 @@
                 };
                 
                 const deployAllProtocols = async (ip) => {
-                    let startPort = parseInt(batchStartPort[ip]); if (!startPort || startPort < 10 || startPort > 65000) return alert('⚠️ 请输入有效的起始端口 (推荐: 8881)');
+                    let startPort = parseInt(batchStartPort[ip]); if (!startPort || startPort < 10 || startPort + 7 > 65535) return alert('⚠️ 请输入有效的起始端口 (推荐: 8881)');
                     const defaultSni = 'addons.mozilla.org'; const commonUser = batchUser[ip] || 'admin'; const commonUUID = crypto.randomUUID(); 
                     const protocolSequence = [ { protocol: 'XTLS-Reality', offset: 0, sni: defaultSni, type: 'reality' }, { protocol: 'Hysteria2', offset: 1, sni: defaultSni }, { protocol: 'TUIC', offset: 2, sni: defaultSni }, { protocol: 'Trojan', offset: 3, sni: defaultSni }, { protocol: 'H2-Reality', offset: 4, sni: defaultSni, type: 'reality' }, { protocol: 'gRPC-Reality', offset: 5, sni: defaultSni, type: 'reality' }, { protocol: 'AnyTLS', offset: 6, sni: defaultSni }, { protocol: 'Naive', offset: 7, sni: defaultSni } ];
                     if (!confirm(`🚀 极速部署确认：\n\n系统将按照 FSCARMEN 模式，向该服务器并发下发完整 ${protocolSequence.length} 个协议矩阵：\n` + protocolSequence.map(p => `- ${p.protocol} (端口: ${startPort + p.offset})`).join('\n') + `\n\n所有节点归属: ${commonUser}\n\n确认立刻组建节点矩阵吗？`)) return;
+                    const failures = [];
                     for (let item of protocolSequence) {
                         const payload = { id: Date.now().toString() + Math.floor(Math.random() * 10000), uuid: commonUUID, vps_ip: ip, protocol: item.protocol, port: startPort + item.offset, username: commonUser, traffic_limit: 0, expire_time: 0, sni: item.sni || '' };
                         if (item.type === 'reality') { const keys = generateRealityKeys(); payload.private_key = keys.privateKey; payload.public_key = keys.publicKey; payload.short_id = keys.shortId; } else if (item.protocol === 'Naive') { payload.uuid = commonUUID.replace(/-/g, '').substring(0, 16); payload.private_key = payload.uuid; } else { const array = new Uint8Array(16); crypto.getRandomValues(array); payload.private_key = btoa(String.fromCharCode.apply(null, array)); }
-                        try { await fetchApi('/api/nodes', { method: 'POST', body: JSON.stringify(payload) }); } catch(e) {}
+                        try { await fetchApi('/api/nodes', { method: 'POST', body: JSON.stringify(payload) }); } catch(e) { failures.push(`${item.protocol}: ${e.message || '失败'}`); }
                     }
-                    batchStartPort[ip] = ''; alert("✅ 极速 8合1 全家桶部署指令已发送！\n\n远端探针将在约十秒后的心跳中自动拉取配置，请稍候。"); refreshData();
+                    batchStartPort[ip] = ''; alert(failures.length ? `⚠️ 部分协议部署失败：\n${failures.join('\n')}` : "✅ 极速 8合1 全家桶部署指令已实时发送！"); refreshData();
                 };
 
                 const deleteNode = async (id) => { await fetchApi(`/api/nodes?id=${id}`, { method: 'DELETE' }); refreshData(); };
@@ -1368,7 +1350,7 @@
                 
                 const generateSubLink = (ip='', format='') => { 
                     const tokenToUse = mySubToken.value || authKey.value; 
-                    let link = `${currentDomain}/api/sub?user=${currentUser.value}&token=${tokenToUse}`;
+                    let link = `${currentDomain}/api/sub?user=${encodeURIComponent(currentUser.value)}&token=${encodeURIComponent(tokenToUse)}`;
                     if (ip) link += `&ip=${ip}`;
                     if (format) link += `&format=${format}`;
                     return link;
@@ -1499,12 +1481,14 @@
                 const applyRealtimeSnapshot = (snapshot) => {
                     if (!snapshot?.ip) return;
                     const key = normalizeRealtimeKey(snapshot.ip);
+                    const resultServer = servers.value.find(item => normalizeRealtimeKey(item.ip) === key);
+                    if (resultServer && snapshot.core_config_result?.component === 'egress' && Number(snapshot.core_config_result.revision) === Number(resultServer.egress_revision)) { resultServer.egress_status = snapshot.core_config_result.success ? 'applied' : 'failed'; resultServer.egress_applied_mode = snapshot.core_config_result.applied_mode; resultServer.egress_error = snapshot.core_config_result.error || ''; if (snapshot.core_config_result.success) resultServer.egress_applied_revision = snapshot.core_config_result.revision; }
                     if (snapshot.core) {
                         const timestamp = Number(snapshot.core_last_seen || snapshot.updated_at || 0);
                         const server = servers.value.find(item => normalizeRealtimeKey(item.ip) === key);
                         if (server && timestamp >= Number(server._realtime_ts || server.last_report || 0)) {
                             const core = snapshot.core;
-                            Object.assign(server, { cpu: core.cpu, mem: core.mem, disk: core.disk, load: core.load, uptime: core.uptime, net_in_speed: core.net_in_speed, net_out_speed: core.net_out_speed, tcp_conn: core.tcp_conn, udp_conn: core.udp_conn, last_report: timestamp, realtime_state: snapshot.core_state, boot_id: snapshot.boot_id?.core, sequence: snapshot.sequence?.core, config_result: snapshot.core_config_result, _realtime_ts: timestamp });
+                            Object.assign(server, { cpu: core.cpu, mem: core.mem, disk: core.disk, load: core.load, uptime: core.uptime, net_in_speed: core.net_in_speed, net_out_speed: core.net_out_speed, tcp_conn: core.tcp_conn, udp_conn: core.udp_conn, last_report: timestamp, realtime_state: snapshot.core_state, boot_id: snapshot.boot_id?.core, sequence: snapshot.sequence?.core, config_result: snapshot.core_config_result, config_result_at: snapshot.core_config_result_at, _realtime_ts: timestamp });
                         }
                         const core = snapshot.core;
                         const probe = publicProbeServers.value.find(item => normalizeRealtimeKey(item.id) === key);
@@ -1553,7 +1537,7 @@
                     publicRealtimeConnectTimer = setTimeout(() => { if (publicRealtimeSocket === socket && socket.readyState === WebSocket.CONNECTING) socket.close(); }, 30000);
                     socket.onopen = () => { if (publicRealtimeSocket !== socket) return socket.close(); clearTimeout(publicRealtimeConnectTimer); publicRealtimeDisconnectedAt = 0; publicRealtimeRetryDelay = 10000; clearTimeout(publicRealtimeFallbackTimer); stopProbePolling(); clearInterval(publicRealtimeActivityTimer); };
                     socket.onmessage = event => { if (publicRealtimeSocket !== socket) return; try { const message = JSON.parse(event.data); if (message.type === 'snapshot') (message.data || []).forEach(applyRealtimeSnapshot); else if (message.type === 'patch') applyRealtimeSnapshot(message.data); } catch(e) {} };
-                    socket.onclose = event => { if (publicRealtimeSocket !== socket) return; clearTimeout(publicRealtimeConnectTimer); publicRealtimeSocket = null; clearInterval(publicRealtimeActivityTimer); if (event.code === 1008) { clearTimeout(publicRealtimeReconnectTimer); startProbePolling(); return; } if (!publicRealtimeDisconnectedAt) publicRealtimeDisconnectedAt = Date.now(); clearTimeout(publicRealtimeFallbackTimer); publicRealtimeFallbackTimer = setTimeout(() => { if (!document.hidden && !isLoggedIn.value) startProbePolling(); }, Math.max(0, 30000 - (Date.now() - publicRealtimeDisconnectedAt))); clearTimeout(publicRealtimeReconnectTimer); const delay = publicRealtimeRetryDelay; publicRealtimeRetryDelay = Math.min(publicRealtimeRetryDelay * 2, 60000); publicRealtimeReconnectTimer = setTimeout(connectPublicRealtime, delay); };
+                    socket.onclose = event => { if (publicRealtimeSocket !== socket) return; clearTimeout(publicRealtimeConnectTimer); publicRealtimeSocket = null; clearInterval(publicRealtimeActivityTimer); if (event.code === 1008) { clearTimeout(publicRealtimeReconnectTimer); stopProbePolling(); publicProbeServers.value = []; probeSys.is_public = 'false'; return; } if (!publicRealtimeDisconnectedAt) publicRealtimeDisconnectedAt = Date.now(); clearTimeout(publicRealtimeFallbackTimer); publicRealtimeFallbackTimer = setTimeout(() => { if (!document.hidden && !isLoggedIn.value) startProbePolling(); }, Math.max(0, 30000 - (Date.now() - publicRealtimeDisconnectedAt))); clearTimeout(publicRealtimeReconnectTimer); const delay = publicRealtimeRetryDelay; publicRealtimeRetryDelay = Math.min(publicRealtimeRetryDelay * 2, 60000); publicRealtimeReconnectTimer = setTimeout(connectPublicRealtime, delay); };
                     socket.onerror = () => socket.close();
                 };
                 const notifyRealtime = async (ip = '') => { if (!realtimeUrl.value || role.value !== 'admin') return; try { const headers = await window.kuiAdminAuthHeader(); await fetch(`${realtimeUrl.value}/notify`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(ip ? { ip } : {}) }); } catch(e) {} };
@@ -1589,7 +1573,7 @@
                 return { 
                     isLoggedIn, showLoginModal, loginUser, password, currentUser, role, activeTab, 
                     servers, nodes, users, newVps, newNodeParams, newUser, 
-                    login, logout, refreshData, addUser, toggleUser, deleteUser, resetUserTraffic, addVps, deleteVps, updateVpsSocks5, socks5Categories, socks5CatSelected, toggleSocks5Cat, addNode, deleteNode, toggleNode, resetTraffic, 
+                    login, logout, refreshData, addUser, toggleUser, deleteUser, resetUserTraffic, addVps, deleteVps, addNode, deleteNode, toggleNode, resetTraffic,
                     getNodesByIp, getVpsName, formatBytes, formatDate, getExpireText, getTrafficPercent, getPingColor, isOnline, generateCmd, generateSubLink, copyCommand,
                     globalOnline, globalTraffic, globalSpeedIn, globalSpeedOut, deployOsMap, saveOsMap, siteTitle, siteTitleInput, saveSiteTitle, userNewPassword, updateUserPassword, resetMySubLink, generateUUIDForNewUser, batchStartPort, batchUser, deployAllProtocols,
                     probeSys, publicProbeServers, filteredProbeServers, probeView, probeDetailId, probeDetail, setProbeView, openProbeDetail, probeGlobalOnline, probeGlobalOffline, probeGlobalSpeedIn, probeGlobalSpeedOut, probeGlobalNetRx, probeGlobalNetTx, filteredProbeGroups, probeCountryStats, currentFilter,
@@ -1598,7 +1582,7 @@
                     qrModalOpen, qrCodeImage, showQrCode, 
                     showWelcomePopup, closePopup,
                     availableThemes, pingNodes, pullGithubNodes, hasCustomCssFlag,
-                    proxyConfig, toggleNodeProxy, saveProxyConfig, switchProxyIP, proxyPool, loadProxyPool,
+                    proxyConfig, toggleNodeProxy, saveProxyConfig, switchProxyIP, proxyPool, loadProxyPool, egressModeLabel, updateVpsEgress, egressModeOf,
                     pollingSettings, applyPollingSettings
                 };
             }

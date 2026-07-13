@@ -16,6 +16,10 @@ API_URL = "https://www.vpngate.net/api/iphone/"
 C2_URL = os.environ.get("C2_URL", "https://YOUR_CONTROLLER_DOMAIN")
 # 控制器 API 前缀：本地 (CF Pages) 控制器为 /api/proxy；独立部署的原版控制器为 /api
 C2_API_PREFIX = os.environ.get("C2_API_PREFIX", "/api/proxy")
+if urllib.parse.urlsplit(C2_URL).scheme != "https":
+    raise RuntimeError("C2_URL must use HTTPS")
+if C2_API_PREFIX not in {"/api", "/api/proxy"}:
+    raise RuntimeError("invalid C2_API_PREFIX")
 
 WORKSPACE = Path("/opt/proxy_lite")
 CONFIG_DIR = WORKSPACE / "configs"
@@ -36,6 +40,7 @@ VPS_IP = os.environ.get("VPS_IP", "")
 PROXY_PORT = 7920
 target_country = "JP"
 last_switch_trigger = 0
+config_generation = 0
 last_config_sync = 0
 last_config_log = ""
 last_update_check = 0
@@ -136,8 +141,18 @@ def check_for_updates():
             staged.append((temporary, target))
         if not staged:
             return
-        for temporary, target in staged:
-            os.replace(temporary, target)
+        replaced = []
+        try:
+            for temporary, target in staged:
+                backup = target.with_name(target.name + ".last-good")
+                if target.exists(): backup.write_bytes(target.read_bytes()); backup.chmod(0o700)
+                os.replace(temporary, target); replaced.append((target, backup))
+        except Exception:
+            for target, backup in reversed(replaced):
+                if backup.exists(): target.write_bytes(backup.read_bytes()); target.chmod(0o700)
+            raise
+        marker = WORKSPACE / ".update-pending"
+        marker.write_text(str(int(time.time()))); marker.chmod(0o600)
         print("[update] residential proxy components updated; restarting", flush=True)
         subprocess.run(["pkill", "-f", "openvpn.*tun_main"], capture_output=True)
         subprocess.run(["pkill", "-f", "openvpn.*tun_backup"], capture_output=True)
@@ -180,7 +195,7 @@ def fetch_controller_config():
     return None
 
 def update_config_loop():
-    global target_country, last_switch_trigger, PROXY_PORT, tun_main, tun_backup, last_config_log, REALTIME_URL, realtime_channel
+    global target_country, last_switch_trigger, PROXY_PORT, tun_main, tun_backup, last_config_log, REALTIME_URL, realtime_channel, config_generation
     while True:
         config_wakeup.clear()
         while realtime_channel and realtime_channel.enabled and not realtime_channel.connected:
@@ -196,6 +211,7 @@ def update_config_loop():
                 config_wakeup.wait(timeout=300)
                 continue
             desired_country = str(data.get("0") or data.get("country") or "JP").upper()
+            if not re.fullmatch(r"[A-Z]{2}|ANY", desired_country): raise ValueError("invalid country")
             new_realtime_url = data.get("realtime_url") or ""
             if new_realtime_url and new_realtime_url != REALTIME_URL:
                 REALTIME_URL = new_realtime_url
@@ -204,6 +220,7 @@ def update_config_loop():
                 realtime_channel.start()
             switch_trigger = int(data.get("switch_trigger", 0))
             new_port = int(data.get("port", 7920))
+            if not 1 <= new_port <= 65535: raise ValueError("invalid proxy port")
             config_log = f"country={desired_country}, port={new_port}, trigger={switch_trigger}"
             if config_log != last_config_log:
                 print(f"[cfg] 配置同步: {config_log}", flush=True)
@@ -212,12 +229,13 @@ def update_config_loop():
             try:
                 pc = data.get("proxy") or {}
                 if isinstance(pc, dict):
+                    enabled = pc.get("enabled") is not False
                     pu = str(pc.get("user", "")) or env_secret("PROXY_USER")
                     pp = str(pc.get("pass", "")) or env_secret("PROXY_PASS")
                     os.environ["PROXY_USER"] = pu
                     os.environ["PROXY_PASS"] = pp
                     if hasattr(proxy_server, "set_credentials"):
-                        proxy_server.set_credentials(pu, pp)
+                        proxy_server.set_credentials(pu if enabled else "", pp if enabled else "")
                     else:
                         proxy_server.PROXY_USER = pu.encode()
                         proxy_server.PROXY_PASS = pp.encode()
@@ -232,6 +250,7 @@ def update_config_loop():
             with state_lock:
                 force_switch = (switch_trigger > last_switch_trigger)
                 if target_country != desired_country or force_switch:
+                    config_generation += 1
                     target_country = desired_country
                     if force_switch: print(f"[*] 收到强制更换指令，正在清退通道并拉黑当前 IP...", flush=True)
                     else: print(f"[*] 策略热切换: 目标重定向到 {desired_country}...", flush=True)
@@ -330,7 +349,7 @@ def harvest_snapshot_nodes() -> list:
                     "ip": ip,
                     "ping": int(raw_ping) if raw_ping.isdigit() else 9999,
                     "country": row.get("CountryShort", "").upper(),
-                    "config": base64.b64decode(row["OpenVPN_ConfigData_Base64"], validate=True).decode("utf-8", errors="replace"),
+                    "config": sanitize_openvpn_config(base64.b64decode(row["OpenVPN_ConfigData_Base64"], validate=True).decode("utf-8", errors="replace"), ip),
                     "harvested_at": time.time()
                 })
             except Exception:
@@ -366,7 +385,7 @@ def setup_routing(tun_name: str, table_id: int):
     subprocess.run(["ip", "rule", "add", "oif", tun_name, "lookup", str(table_id), "pref", str(table_id)], capture_output=True)
     subprocess.run(["ip", "rule", "add", "iif", tun_name, "lookup", str(table_id), "pref", str(table_id + 1000)], capture_output=True)
 
-def connect_node(tun: Tunnel, node: dict):
+def connect_node(tun: Tunnel, node: dict, generation: int):
     global dead_ips
     try:
         print(f"[*] {tun.name} 开始拨号: {node['country']} {node['ip']} (ping={node['ping']})", flush=True)
@@ -385,6 +404,10 @@ def connect_node(tun: Tunnel, node: dict):
                "--connect-timeout", "5", "--connect-retry-max", "1", "--verb", "3"] + cipher_args
                
         with open(log_file, "w") as f: process = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
+        with state_lock:
+            if generation != config_generation:
+                process.terminate(); return
+            tun.process = process
         
         success = False
         for _ in range(15):
@@ -396,6 +419,9 @@ def connect_node(tun: Tunnel, node: dict):
             except: pass
                 
         if success and process.poll() is None:
+            with state_lock:
+                if generation != config_generation or (target_country != "ANY" and node.get("country") != target_country):
+                    process.terminate(); return
             setup_routing(tun.name, tun.table_id)
             time.sleep(1) 
             
@@ -488,6 +514,8 @@ def connect_node(tun: Tunnel, node: dict):
                 return
 
             with state_lock:
+                if generation != config_generation or (target_country != "ANY" and node.get("country") != target_country):
+                    process.terminate(); return
                 tun.process = process
                 tun.node = node
                 # 此时不再需要赋 entry_ip，因为在 maintain_pool 里已提前锁住坑位
@@ -559,18 +587,18 @@ def get_best_candidate():
     global global_node_reservoir, dead_ips, target_country, tun_main, tun_backup
     with reservoir_lock:
         all_pool_nodes = sorted(list(global_node_reservoir.values()), key=lambda x: x["ping"])
-        candidates = [n for n in all_pool_nodes if n["country"] == target_country and n["ip"] not in dead_ips]
+        candidates = [n for n in all_pool_nodes if (target_country == "ANY" or n["country"] == target_country) and n["ip"] not in dead_ips]
         
         with state_lock:
             active_ips = [ip for ip in (tun_main.entry_ip, tun_backup.entry_ip) if ip]
         candidates = [n for n in candidates if n["ip"] not in active_ips]
 
         if not candidates:
-            has_blacklisted = any(n["country"] == target_country for n in all_pool_nodes)
+            has_blacklisted = any(target_country == "ANY" or n["country"] == target_country for n in all_pool_nodes)
             if has_blacklisted:
                 dead_ips.clear()
                 print(f"[!] ⚡ 紧急熔断：[{target_country}] 节点黑名单释放救场（由于动态信誉系统存在，历史坏节点将被沉底）", flush=True)
-                candidates = [n for n in all_pool_nodes if n["country"] == target_country and n["ip"] not in active_ips]
+                candidates = [n for n in all_pool_nodes if (target_country == "ANY" or n["country"] == target_country) and n["ip"] not in active_ips]
 
         if candidates: return candidates.pop(0)
         country_counts = {}
@@ -578,6 +606,36 @@ def get_best_candidate():
             country_counts[node["country"]] = country_counts.get(node["country"], 0) + 1
         print(f"[!] 无可用 {target_country} 候选；节点分布={country_counts}，黑名单={len(dead_ips)}", flush=True)
     return None
+
+def sanitize_openvpn_config(raw: str, expected_ip: str) -> str:
+    allowed = {"proto", "port", "cipher", "auth", "auth-nocache", "remote-cert-tls", "verify-x509-name", "tls-version-min", "tls-cipher", "compress", "comp-lzo", "key-direction", "reneg-sec"}
+    blocked = {"script-security", "up", "down", "route-up", "route-pre-down", "plugin", "management", "config", "cd", "chroot", "daemon", "log", "log-append", "writepid", "client-connect", "client-disconnect", "learn-address"}
+    blocks = {"ca", "cert", "key", "tls-auth", "tls-crypt", "tls-crypt-v2"}
+    output = ["client", "dev tun", "nobind", "persist-key", "persist-tun", "remote-random"]
+    in_block = None
+    for original in raw.splitlines():
+        line = original.strip()
+        if not line or line.startswith(('#', ';')): continue
+        if in_block:
+            output.append(line)
+            if line.lower() == f"</{in_block}>": in_block = None
+            continue
+        if line.startswith('<') and line.endswith('>') and not line.startswith('</'):
+            name = line[1:-1].strip().lower()
+            if name not in blocks: raise ValueError(f"unsafe OpenVPN inline block: {name}")
+            in_block = name; output.append(f"<{name}>"); continue
+        parts = line.split()
+        directive = parts[0].lower()
+        if directive in blocked: raise ValueError(f"unsafe OpenVPN directive: {directive}")
+        if directive == "remote":
+            port = int(parts[2]) if len(parts) > 2 else 1194
+            if not 1 <= port <= 65535: raise ValueError("invalid OpenVPN remote port")
+            output.append(f"remote {expected_ip} {port}")
+        elif directive in allowed:
+            output.append(line)
+    if in_block: raise ValueError(f"unterminated OpenVPN block: {in_block}")
+    if not any(line.startswith("remote ") for line in output): raise ValueError("OpenVPN profile has no remote")
+    return "\n".join(output) + "\n"
 
 def maintain_pool():
     global dead_ips, last_blacklist_clear, tun_main, tun_backup
@@ -628,7 +686,7 @@ def maintain_pool():
                 with state_lock: 
                     tun_main.is_connecting = True
                     tun_main.entry_ip = node["ip"] # FIX 1: 提前占住坑位，防止备用通道刚好获取到同样的 IP 导致死锁冲突
-                threading.Thread(target=connect_node, args=(tun_main, node,), daemon=True).start()
+                threading.Thread(target=connect_node, args=(tun_main, node, config_generation), daemon=True).start()
                 time.sleep(1)
         elif needs_backup:
             node = get_best_candidate()
@@ -636,7 +694,7 @@ def maintain_pool():
                 with state_lock: 
                     tun_backup.is_connecting = True
                     tun_backup.entry_ip = node["ip"] # FIX 1: 提前占住坑位
-                threading.Thread(target=connect_node, args=(tun_backup, node,), daemon=True).start()
+                threading.Thread(target=connect_node, args=(tun_backup, node, config_generation), daemon=True).start()
 
         time.sleep(2)
 
@@ -646,6 +704,19 @@ def main():
     check_for_updates()
     get_public_ip()
     setup_env()
+    try:
+        initial = fetch_controller_config()
+        if initial:
+            candidate_port = int(initial.get("port", 7920))
+            PROXY_PORT = candidate_port if 1 <= candidate_port <= 65535 else 7920
+            target_country = str(initial.get("0") or initial.get("country") or "JP").upper()
+            last_switch_trigger = int(initial.get("switch_trigger", 0))
+            pc = initial.get("proxy") or {}
+            if pc:
+                enabled = pc.get("enabled") is not False
+                proxy_server.set_credentials((str(pc.get("user", "")) or env_secret("PROXY_USER")) if enabled else "", (str(pc.get("pass", "")) or env_secret("PROXY_PASS")) if enabled else "")
+    except Exception as error:
+        print(f"[cfg] initial controller sync failed, using fallback values: {error}", flush=True)
     subprocess.run(["pkill", "-f", "openvpn.*tun_main"], capture_output=True)
     subprocess.run(["pkill", "-f", "openvpn.*tun_backup"], capture_output=True)
     
@@ -669,6 +740,8 @@ def main():
     threading.Thread(target=run_proxy_server, daemon=True).start()
     threading.Thread(target=health_check_loop, daemon=True).start()
     threading.Thread(target=c2_heartbeat_loop, daemon=True).start()
+    try: (WORKSPACE / ".update-pending").unlink()
+    except FileNotFoundError: pass
     maintain_pool()
 
 if __name__ == "__main__":
