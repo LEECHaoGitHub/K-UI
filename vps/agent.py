@@ -949,10 +949,7 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
         }
         warp_inbounds = [f"in-{node['id']}" for node in valid_nodes if node.get("protocol") != "dokodemo-door"]
         if warp_inbounds:
-            warp_rule = {"inbound": warp_inbounds, "action": "route", "outbound": "warp-out"}
-            if warp_mode == "ipv4": warp_rule["ip_version"] = 4
-            elif warp_mode == "ipv6": warp_rule["ip_version"] = 6
-            singbox_config["route"]["rules"].append(warp_rule)
+            singbox_config["route"]["rules"].append({"inbound": warp_inbounds, "action": "route", "outbound": "warp-out"})
             if warp_mode == "ipv4": singbox_config["route"]["rules"].append({"inbound": warp_inbounds, "ip_version": 6, "action": "reject"})
             elif warp_mode == "ipv6": singbox_config["route"]["rules"].append({"inbound": warp_inbounds, "ip_version": 4, "action": "reject"})
         singbox_config["inbounds"].append({"type": "socks", "tag": "egress-check-in", "listen": "127.0.0.1", "listen_port": 39482})
