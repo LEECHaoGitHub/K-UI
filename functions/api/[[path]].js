@@ -8,6 +8,30 @@ async function sha256(text) {
     return Array.from(new Uint8Array(buffer)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+async function realtimeAdminHeader(env) {
+    if (!env.ADMIN_PASSWORD) return null;
+    const username = env.ADMIN_USERNAME || 'admin';
+    const timestamp = Date.now().toString();
+    const keyHex = await sha256(env.ADMIN_PASSWORD);
+    const keyBytes = new Uint8Array(keyHex.match(/.{2}/g).map(byte => parseInt(byte, 16)));
+    const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(username + timestamp));
+    const signatureHex = Array.from(new Uint8Array(signature), byte => byte.toString(16).padStart(2, '0')).join('');
+    return `${btoa(username)}.${timestamp}.${signatureHex}`;
+}
+
+async function notifyRealtimePublicPolicy(env, db, enabled) {
+    const authorization = await realtimeAdminHeader(env);
+    if (!authorization) return;
+    const configured = env.REALTIME_URL || (await db.prepare("SELECT val FROM sys_config WHERE key = 'realtime_url'").first())?.val;
+    if (!configured) return;
+    await fetch(`${configured.replace(/\/$/, '')}/public-policy`, {
+        method: 'POST',
+        headers: { Authorization: authorization, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ public: enabled }),
+    });
+}
+
 async function chunkBatch(db, statements, size = 100) {
     for (let i = 0; i < statements.length; i += size) {
         await db.batch(statements.slice(i, i + size));
@@ -402,7 +426,7 @@ async function verifyAuth(authHeader, db, env) {
         let baseKeyHex;
         if (username === adminUser) baseKeyHex = await sha256(adminPass);
         else {
-            const user = await db.prepare("SELECT password FROM users WHERE username = ?").bind(username).first();
+            const user = await db.prepare("SELECT password FROM users WHERE username = ? AND enable = 1").bind(username).first();
             if (!user || !/^[0-9a-f]{64}$/i.test(user.password || '')) return null;
             baseKeyHex = user.password;
         }
@@ -488,7 +512,9 @@ async function handleProbeAPI(request, env, context, pathArray) {
                 else if (text.startsWith('cb_tog_')) {
                     const key = text.replace('cb_tog_', '');
                     let cur = 'true'; try { const r = await db.prepare('SELECT value FROM probe_settings WHERE key=?').bind(key).first(); if(r) cur = r.value; } catch(e){}
-                    await db.prepare('INSERT INTO probe_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(key, cur==='true'?'false':'true').run();
+                    const next = cur === 'true' ? 'false' : 'true';
+                    await db.prepare('INSERT INTO probe_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(key, next).run();
+                    if (key === 'is_public') await notifyRealtimePublicPolicy(env, db, next === 'true').catch(() => {});
                     await tgSend(chatId, `✅ 属性 ${key} 已成功切换！`);
                 }
             }
@@ -522,7 +548,8 @@ async function handleProbeAPI(request, env, context, pathArray) {
         const servers = (await db.prepare('SELECT id, name, cpu, ram, disk, load_avg, uptime, last_updated, net_in_speed, net_out_speed, os, arch, virt, tcp_conn, udp_conn, country, ip_v4, ip_v6, server_group, price, expire_date, bandwidth, traffic_limit, ping_ct, ping_cu, ping_cm, ping_bd, monthly_rx, monthly_tx, net_rx, net_tx, cpu_info, ram_used, ram_total, disk_used, disk_total FROM probe_servers WHERE is_hidden != "true"').all()).results;
         const publicKeys = new Set(['theme', 'is_public', 'site_title', 'show_price', 'show_expire', 'show_bw', 'show_tf', 'custom_css', 'custom_bg', 'custom_head', 'custom_script', 'report_interval', 'enable_popup', 'popup_content', 'cached_nodes_data', 'auto_reset_traffic', 'visits_total', 'visits_today', 'visits_date']);
         for (const key of Object.keys(settings)) if (!publicKeys.has(key)) delete settings[key];
-        return Response.json({ settings, servers });
+        const realtime = env.REALTIME_URL ? null : await db.prepare("SELECT val FROM sys_config WHERE key = 'realtime_url'").first();
+        return Response.json({ settings, servers, realtime_url: env.REALTIME_URL || realtime?.val || '' });
     }
 
     if (method === 'GET' && subPath === 'detail') {
@@ -561,6 +588,7 @@ async function handleProbeAPI(request, env, context, pathArray) {
     if (method === 'POST' && subPath === 'admin/settings') {
         const { settings } = await request.json();
         for (const [k, v] of Object.entries(settings)) { await db.prepare('INSERT INTO probe_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(k, v).run(); }
+        if (Object.prototype.hasOwnProperty.call(settings, 'is_public')) await notifyRealtimePublicPolicy(env, db, settings.is_public === 'true').catch(() => {});
         if (settings.tg_bot_token) {
             try {
                await fetch(`https://api.telegram.org/bot${settings.tg_bot_token}/setWebhook`, {
@@ -764,7 +792,9 @@ async function proxyLocal(method, subPath, req, env) {
 
 async function checkOfflineServers(env) {
     const db = env.DB; const nowMs = Date.now();
-    const { results } = await db.prepare(`SELECT ip, name, last_report FROM servers WHERE last_report < ? AND alert_sent = 0`).bind(nowMs - 360000).all();
+    const realtime = env.REALTIME_URL || (await db.prepare("SELECT val FROM sys_config WHERE key = 'realtime_url'").first())?.val;
+    const offlineThreshold = realtime ? 1200000 : 360000;
+    const { results } = await db.prepare(`SELECT ip, name, last_report FROM servers WHERE last_report < ? AND alert_sent = 0`).bind(nowMs - offlineThreshold).all();
     if (!results || !results.length) return 0;
     let tgBotToken = env.TG_BOT_TOKEN; let tgChatId = env.TG_CHAT_ID;
     try { const { results: settings } = await db.prepare("SELECT key, value FROM probe_settings WHERE key IN ('tg_bot_token', 'tg_chat_id')").all(); settings.forEach(r => { if(r.key === 'tg_bot_token') tgBotToken = r.value; if(r.key === 'tg_chat_id') tgChatId = r.value; }); } catch(e){}
@@ -1043,7 +1073,7 @@ export async function onRequest(context) {
             isValid = !!adminSubToken && token === adminSubToken;
         } 
         else { 
-            const u = await db.prepare("SELECT password, sub_token FROM users WHERE username = ?").bind(reqUser).first(); 
+            const u = await db.prepare("SELECT password, sub_token FROM users WHERE username = ? AND enable = 1").bind(reqUser).first();
             if (u) isValid = !!u.sub_token && token === u.sub_token;
         }
         

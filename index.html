@@ -204,7 +204,7 @@
                             <h2 class="text-xl sm:text-2xl font-black m-0 mr-3 flex items-center card-title-text">
                                 <img v-if="probeDetail.country && probeDetail.country !== 'XX'" :src="'https://flagcdn.com/24x18/' + probeDetail.country.toLowerCase() + '.png'" class="mr-2 rounded-sm">{{ probeDetail.name }}
                             </h2>
-                            <span class="px-2.5 py-1 rounded-full text-xs font-bold text-white" :style="{background: isOnline(probeDetail.last_updated) ? '#10b981' : '#ef4444'}">{{ isOnline(probeDetail.last_updated) ? '在线' : '离线' }}</span>
+                            <span class="px-2.5 py-1 rounded-full text-xs font-bold text-white" :style="{background: isOnline(probeDetail.last_updated, probeDetail.realtime_state) ? '#10b981' : '#ef4444'}">{{ isOnline(probeDetail.last_updated, probeDetail.realtime_state) ? '在线' : '离线' }}</span>
                         </div>
                         <div class="probe-info-grid info-grid">
                             <div class="flex flex-col"><span class="probe-info-label info-label">运行时间</span><span class="font-medium info-value">{{ probeDetail.uptime || 'N/A' }}</span></div>
@@ -258,7 +258,7 @@
                                 <div v-for="s in servers" :key="s.id" @click="openProbeDetail(s.id)" class="probe-vps-card vps-card">
                                     <div class="probe-card-left card-left">
                                         <div class="probe-card-title card-title">
-                                            <div class="probe-status-dot status-dot" :style="{background: isOnline(s.last_updated) ? '#10b981' : '#ef4444'}"></div>
+                                            <div class="probe-status-dot status-dot" :style="{background: isOnline(s.last_updated, s.realtime_state) ? '#10b981' : '#ef4444'}"></div>
                                             <img v-if="s.country && s.country !== 'XX'" :src="'https://flagcdn.com/24x18/' + (s.country === 'TW' ? 'cn' : s.country.toLowerCase()) + '.png'" class="mr-1.5 rounded-sm">
                                             <span class="text-[15px] truncate card-title-text">{{ s.name }}</span>
                                         </div>
@@ -316,7 +316,7 @@
                             <tbody>
                                 <tr v-if="filteredProbeServers.length===0"><td colspan="11" class="text-center">暂无数据</td></tr>
                                 <tr v-for="s in filteredProbeServers" :key="s.id" @click="openProbeDetail(s.id)">
-                                    <td class="text-center"><div class="probe-status-dot status-dot inline-block m-0" :style="{background: isOnline(s.last_updated) ? '#10b981' : '#ef4444'}"></div></td>
+                                    <td class="text-center"><div class="probe-status-dot status-dot inline-block m-0" :style="{background: isOnline(s.last_updated, s.realtime_state) ? '#10b981' : '#ef4444'}"></div></td>
                                     <td><b class="card-title-text">{{ s.name }}</b></td>
                                     <td><img v-if="s.country && s.country!=='XX'" :src="'https://flagcdn.com/24x18/' + (s.country === 'TW' ? 'cn' : s.country.toLowerCase()) + '.png'"></td>
                                     <td><span class="text-xs text-gray-500 os-text">{{ s.os||'-' }} / {{ s.arch||'-' }} / {{ s.virt||'-' }}</span></td>
@@ -856,7 +856,7 @@
                                     <tr v-for="s in adminProbeServers" :key="s.id" class="border-b border-slate-50 hover:bg-slate-50">
                                         <td class="p-4 font-bold text-slate-700">{{ s.name }} <span v-if="s.is_hidden==='true'" class="text-[10px] bg-slate-200 text-slate-600 px-2 py-0.5 rounded">隐藏</span></td>
                                         <td class="p-4">{{ s.server_group || '默认分组' }}</td>
-                                        <td class="p-4"><span v-if="isOnline(s.last_updated)" class="text-emerald-500 font-bold">● 在线</span><span v-else class="text-rose-500 font-bold">● 离线</span></td>
+                                        <td class="p-4"><span v-if="isOnline(s.last_updated, s.realtime_state)" class="text-emerald-500 font-bold">● 在线</span><span v-else class="text-rose-500 font-bold">● 离线</span></td>
                                         <td class="p-4 flex gap-2">
                                             <button @click="openProbeEditModal(s)" class="bg-blue-50 text-blue-600 hover:bg-blue-100 px-3 py-1.5 rounded-lg font-bold transition">编辑展示信息</button>
                                             <button @click="deleteProbeNode(s.id)" class="bg-rose-50 text-rose-600 hover:bg-rose-100 px-3 py-1.5 rounded-lg font-bold transition">删除记录</button>
@@ -959,7 +959,8 @@
                 const servers = ref([]); const nodes = ref([]); const users = ref([]);
                 const realtimeUrl = ref('');
                 const realtimeConnected = ref(false);
-                let realtimeSocket = null; let realtimeReconnectTimer = null; let realtimeFallbackTimer = null; let realtimeConnectTimer = null; let realtimePingTimer = null; let realtimeGeneration = 0; let realtimeDisconnectedAt = 0; let lastRealtimePing = 0;
+                let realtimeSocket = null; let realtimeReconnectTimer = null; let realtimeFallbackTimer = null; let realtimeConnectTimer = null; let realtimePingTimer = null; let realtimeGeneration = 0; let realtimeDisconnectedAt = 0; let lastRealtimePing = 0; let realtimeRetryDelay = 5000;
+                let publicRealtimeSocket = null; let publicRealtimeReconnectTimer = null; let publicRealtimeFallbackTimer = null; let publicRealtimeActivityTimer = null; let publicRealtimeDisconnectedAt = 0; let publicRealtimeRetryDelay = 10000;
                 const newVps = ref({ name: '', ip: '', os: 'debian' }); const newNodeParams = reactive({}); const newUser = reactive({ username: '', password: '', traffic_limit_gb: '', expire_date: '' });
                 const mySubToken = ref(''); const siteTitle = ref(''); const siteTitleInput = ref(''); const userNewPassword = ref('');
                 const batchStartPort = reactive({}); const batchUser = reactive({}); 
@@ -1062,7 +1063,7 @@
                 watch(() => probeSys.custom_bg, updateCustomStyles);
                 watch(() => probeSys.custom_script, updateCustomScript);
 
-                const isOnline = (lastReport, realtimeState = '') => realtimeState ? realtimeState === 'online' : !!lastReport && (Date.now() - lastReport) < 240000;
+                const isOnline = (lastReport, realtimeState = '') => realtimeState ? realtimeState === 'online' : !!lastReport && (Date.now() - lastReport) < 1200000;
                 const formatBytes = (bytes) => { const b = parseInt(bytes); if (isNaN(b) || b === 0) return '0 B'; const k = 1024, sizes = ['B', 'KB', 'MB', 'GB', 'TB'], i = Math.floor(Math.log(b) / Math.log(k)); return parseFloat((b / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]; };
                 const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
                 const formatDate = (ts) => { if (!ts) return '永久'; const d = new Date(ts); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; };
@@ -1133,7 +1134,7 @@
                         if (res.ok) {
                             const data = await res.json(); authKey.value = hashedPass; currentUser.value = loginUser.value; role.value = data.role;
                             localStorage.setItem('kui_auth_key', authKey.value); localStorage.setItem('kui_user', currentUser.value); localStorage.setItem('kui_role', role.value);
-                            isLoggedIn.value = true; showLoginModal.value = false; password.value = ''; 
+                            isLoggedIn.value = true; showLoginModal.value = false; password.value = ''; const publicSocket = publicRealtimeSocket; publicRealtimeSocket = null; publicSocket?.close(); clearTimeout(publicRealtimeReconnectTimer); clearTimeout(publicRealtimeFallbackTimer); clearInterval(publicRealtimeActivityTimer);
                             activeTab.value = role.value === 'admin' ? 'nodes' : 'dashboard';
                             startPolling(); fetchProbeData(); queueMicrotask(connectRealtime);
                         } else alert('⚠️ 账户名或密码错误');
@@ -1231,7 +1232,10 @@
                             const data = await res.json(); 
                             Object.assign(probeSys, data.settings); 
                             if (data.settings.cached_nodes_data) parseCachedNodes(data.settings.cached_nodes_data);
-                            publicProbeServers.value = data.servers || []; updateCustomStyles();
+                            publicProbeServers.value = data.servers || [];
+                            if (data.realtime_url && data.realtime_url !== realtimeUrl.value) realtimeUrl.value = data.realtime_url;
+                            if (!isLoggedIn.value && data.settings.is_public === 'true') queueMicrotask(connectPublicRealtime);
+                            updateCustomStyles();
                             if ((!isLoggedIn.value || activeTab.value === 'probe') && probeSys.custom_script && !document.getElementById('kui-custom-html-wrapper')) updateCustomScript(probeSys.custom_script);
                             if (probeView.value === 'map') drawMarkers();
                             if (probeSys.is_public !== 'true' && !isLoggedIn.value) showLoginModal.value = true;
@@ -1364,7 +1368,7 @@
                     } catch (err) { alert('生成二维码失败！请检查链接长度或浏览器控制台。'); }
                 };
 
-                const saveProbeSettings = async () => { await fetchApi('/api/probe/admin/settings', { method: 'POST', body: JSON.stringify({settings: probeSys}) }); alert('✅ 探针大盘配置已生效！如果配置了TG参数已自动绑定Webhook。'); refreshData(); fetchProbeData(); };
+                const saveProbeSettings = async () => { await fetchApi('/api/probe/admin/settings', { method: 'POST', body: JSON.stringify({settings: probeSys}) }); if (realtimeUrl.value) { try { const headers = await window.kuiAdminAuthHeader(); await fetch(`${realtimeUrl.value}/public-policy`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ public: probeSys.is_public === 'true' }) }); } catch(e) {} } alert('✅ 探针大盘配置已生效！如果配置了TG参数已自动绑定Webhook。'); refreshData(); fetchProbeData(); };
                 const openProbeEditModal = (s) => { editingProbeNode.value = JSON.parse(JSON.stringify(s)); if(!editingProbeNode.value.is_hidden) editingProbeNode.value.is_hidden = 'false'; if(!editingProbeNode.value.reset_day) editingProbeNode.value.reset_day = '1'; probeEditModalOpen.value = true; };
                 const saveProbeEdit = async () => { await fetchApi('/api/probe/admin/server', { method: 'PUT', body: JSON.stringify(editingProbeNode.value) }); probeEditModalOpen.value = false; refreshData(); fetchProbeData(); };
                 const deleteProbeNode = async (id) => { if (!confirm("⚠️ 确定要彻底删除该探针记录吗？如果机器还在运行 Agent，之后会自动复活！请确保先在面板的「服务器与节点」中删除此机器。")) return; await fetchApi(`/api/probe/admin/server?id=${id}`, { method: 'DELETE' }); refreshData(); fetchProbeData(); };
@@ -1484,6 +1488,7 @@
                         Object.assign(server, { cpu: core.cpu, mem: core.mem, disk: core.disk, load: core.load, uptime: core.uptime, net_in_speed: core.net_in_speed, net_out_speed: core.net_out_speed, tcp_conn: core.tcp_conn, udp_conn: core.udp_conn, last_report: snapshot.core_last_seen || snapshot.updated_at, realtime_state: snapshot.core_state, boot_id: snapshot.boot_id?.core, sequence: snapshot.sequence?.core, config_result: snapshot.core_config_result });
                         const probe = publicProbeServers.value.find(item => item.id === snapshot.ip);
                         if (probe) Object.assign(probe, { cpu: core.cpu, ram: core.mem, disk: core.disk, load_avg: core.load, uptime: core.uptime, net_in_speed: core.net_in_speed, net_out_speed: core.net_out_speed, tcp_conn: core.tcp_conn, udp_conn: core.udp_conn, last_updated: snapshot.core_last_seen || snapshot.updated_at, realtime_state: snapshot.core_state });
+                        if (probeDetail.value?.id === snapshot.ip) Object.assign(probeDetail.value, { cpu: core.cpu, ram: core.mem, disk: core.disk, load_avg: core.load, uptime: core.uptime, net_in_speed: core.net_in_speed, net_out_speed: core.net_out_speed, tcp_conn: core.tcp_conn, udp_conn: core.udp_conn, last_updated: snapshot.core_last_seen || snapshot.updated_at, realtime_state: snapshot.core_state });
                     }
                     window.kuiRealtimeProxySnapshots = window.kuiRealtimeProxySnapshots || {};
                     if (snapshot.proxy) { window.kuiRealtimeProxySnapshots[snapshot.ip] = snapshot; if (activeTab.value === 'proxy') setTimeout(pcFetchNodes, 0); }
@@ -1512,11 +1517,21 @@
                         realtimeSocket = socket;
                         clearTimeout(realtimeConnectTimer);
                         realtimeConnectTimer = setTimeout(() => { if (realtimeSocket === socket && socket.readyState === WebSocket.CONNECTING) socket.close(); }, 30000);
-                        socket.onopen = () => { if (realtimeSocket !== socket || generation !== realtimeGeneration) return socket.close(); clearTimeout(realtimeConnectTimer); realtimeDisconnectedAt = 0; lastRealtimePing = Date.now(); realtimeConnected.value = true; window.kuiRealtimeConnected = true; clearTimeout(realtimeFallbackTimer); stopPolling(); stopProbePolling(); pcStopProxy(); clearInterval(realtimePingTimer); realtimePingTimer = setInterval(() => { const now = Date.now(); if (realtimeSocket?.readyState === WebSocket.OPEN && now - lastRealtimePing >= 30000) { realtimeSocket.send('ping'); lastRealtimePing = now; } servers.value.forEach(server => { if (server.realtime_state === 'online' && now - server.last_report > 20000) server.realtime_state = 'stale'; }); publicProbeServers.value.forEach(server => { if (server.realtime_state === 'online' && server.last_updated && now - server.last_updated > 20000) server.realtime_state = 'stale'; }); if (activeTab.value === 'proxy') pcFetchNodes(); }, 5000); };
+                        socket.onopen = () => { if (realtimeSocket !== socket || generation !== realtimeGeneration) return socket.close(); clearTimeout(realtimeConnectTimer); realtimeDisconnectedAt = 0; realtimeRetryDelay = 5000; lastRealtimePing = Date.now(); realtimeConnected.value = true; window.kuiRealtimeConnected = true; clearTimeout(realtimeFallbackTimer); publicRealtimeSocket?.close(); stopPolling(); stopProbePolling(); pcStopProxy(); clearInterval(realtimePingTimer); realtimePingTimer = setInterval(() => { const now = Date.now(); if (realtimeSocket?.readyState === WebSocket.OPEN && now - lastRealtimePing >= 30000) { realtimeSocket.send('ping'); lastRealtimePing = now; } if (realtimeSocket?.readyState === WebSocket.OPEN && now % 60000 < 5000) realtimeSocket.send(JSON.stringify({ type: 'activity' })); servers.value.forEach(server => { if (server.realtime_state === 'online' && now - server.last_report > 20000) server.realtime_state = 'stale'; }); publicProbeServers.value.forEach(server => { if (server.realtime_state === 'online' && server.last_updated && now - server.last_updated > 20000) server.realtime_state = 'stale'; }); if (activeTab.value === 'proxy') pcFetchNodes(); }, 5000); };
                         socket.onmessage = event => { if (realtimeSocket !== socket) return; try { const message = JSON.parse(event.data); if (message.type === 'snapshot') (message.data || []).forEach(applyRealtimeSnapshot); else if (message.type === 'patch') applyRealtimeSnapshot(message.data); } catch(e) {} };
-                        socket.onclose = () => { if (realtimeSocket !== socket) return; clearTimeout(realtimeConnectTimer); clearInterval(realtimePingTimer); realtimeConnected.value = false; window.kuiRealtimeConnected = false; realtimeSocket = null; if (isLoggedIn.value && !document.hidden) { scheduleRealtimeFallback(); clearTimeout(realtimeReconnectTimer); realtimeReconnectTimer = setTimeout(connectRealtime, 5000); } };
+                        socket.onclose = () => { if (realtimeSocket !== socket) return; clearTimeout(realtimeConnectTimer); clearInterval(realtimePingTimer); realtimeConnected.value = false; window.kuiRealtimeConnected = false; realtimeSocket = null; if (isLoggedIn.value && !document.hidden) { scheduleRealtimeFallback(); clearTimeout(realtimeReconnectTimer); const delay = realtimeRetryDelay; realtimeRetryDelay = Math.min(realtimeRetryDelay * 2, 60000); realtimeReconnectTimer = setTimeout(connectRealtime, delay); } };
                         socket.onerror = () => socket.close();
-                    } catch(e) { if (generation !== realtimeGeneration) return; scheduleRealtimeFallback(); clearTimeout(realtimeReconnectTimer); realtimeReconnectTimer = setTimeout(connectRealtime, 10000); }
+                    } catch(e) { if (generation !== realtimeGeneration) return; scheduleRealtimeFallback(); clearTimeout(realtimeReconnectTimer); const delay = realtimeRetryDelay; realtimeRetryDelay = Math.min(realtimeRetryDelay * 2, 60000); realtimeReconnectTimer = setTimeout(connectRealtime, delay); }
+                };
+                const connectPublicRealtime = () => {
+                    if (isLoggedIn.value || !realtimeUrl.value || probeSys.is_public !== 'true' || document.hidden) return;
+                    if (publicRealtimeSocket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(publicRealtimeSocket.readyState)) return;
+                    const socket = new WebSocket(realtimeUrl.value.replace(/^http/, 'ws') + '/public/ws');
+                    publicRealtimeSocket = socket;
+                    socket.onopen = () => { if (publicRealtimeSocket !== socket) return socket.close(); publicRealtimeDisconnectedAt = 0; publicRealtimeRetryDelay = 10000; clearTimeout(publicRealtimeFallbackTimer); stopProbePolling(); clearInterval(publicRealtimeActivityTimer); publicRealtimeActivityTimer = setInterval(() => { if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'activity' })); }, 60000); };
+                    socket.onmessage = event => { if (publicRealtimeSocket !== socket) return; try { const message = JSON.parse(event.data); if (message.type === 'snapshot') (message.data || []).forEach(applyRealtimeSnapshot); else if (message.type === 'patch') applyRealtimeSnapshot(message.data); } catch(e) {} };
+                    socket.onclose = event => { if (publicRealtimeSocket !== socket) return; publicRealtimeSocket = null; clearInterval(publicRealtimeActivityTimer); if (event.code === 1008) { clearTimeout(publicRealtimeReconnectTimer); startProbePolling(); return; } if (!publicRealtimeDisconnectedAt) publicRealtimeDisconnectedAt = Date.now(); clearTimeout(publicRealtimeFallbackTimer); publicRealtimeFallbackTimer = setTimeout(() => { if (!document.hidden && !isLoggedIn.value) startProbePolling(); }, Math.max(0, 30000 - (Date.now() - publicRealtimeDisconnectedAt))); clearTimeout(publicRealtimeReconnectTimer); const delay = publicRealtimeRetryDelay; publicRealtimeRetryDelay = Math.min(publicRealtimeRetryDelay * 2, 60000); publicRealtimeReconnectTimer = setTimeout(connectPublicRealtime, delay); };
+                    socket.onerror = () => socket.close();
                 };
                 const notifyRealtime = async (ip = '') => { if (!realtimeUrl.value || role.value !== 'admin') return; try { const headers = await window.kuiAdminAuthHeader(); await fetch(`${realtimeUrl.value}/notify`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(ip ? { ip } : {}) }); } catch(e) {} };
                 window.kuiNotifyRealtime = notifyRealtime;
@@ -1526,7 +1541,7 @@
                     if (!pingTimer) { sendUiPing(); pingTimer = setInterval(() => { if (isLoggedIn.value && !document.hidden) sendUiPing(); }, pollingSettings.pingInterval); }
                 };
                 const startProbePolling = () => { 
-                    if (realtimeConnected.value && isLoggedIn.value && role.value === 'admin') return;
+                    if ((realtimeConnected.value && isLoggedIn.value && role.value === 'admin') || publicRealtimeSocket?.readyState === WebSocket.OPEN) return;
                     if (!probeTimer) { fetchProbeData(); probeTimer = setInterval(() => { if (!document.hidden && (!isLoggedIn.value || activeTab.value === 'probe')) fetchProbeData(); }, pollingSettings.probeInterval); } 
                 }
                 const stopProbePolling = () => { if (probeTimer) { clearInterval(probeTimer); probeTimer = null; } };
@@ -1545,7 +1560,7 @@
                 onMounted(() => {
                     fetchProbeData(); startProbePolling();
                     if (authKey.value && currentUser.value) { isLoggedIn.value = true; if (role.value !== 'admin' && activeTab.value === 'proxy') activeTab.value = 'dashboard'; startPolling(); if (activeTab.value === 'proxy') setTimeout(pcInitProxy, 0); }
-                    document.addEventListener('visibilitychange', () => { if (document.hidden) { realtimeGeneration++; realtimeDisconnectedAt = 0; stopPolling(); stopProbePolling(); clearInterval(realtimePingTimer); clearTimeout(realtimeFallbackTimer); clearTimeout(realtimeReconnectTimer); const socket = realtimeSocket; realtimeSocket = null; socket?.close(); realtimeConnected.value = false; window.kuiRealtimeConnected = false; } else if (isLoggedIn.value && role.value === 'admin' && realtimeUrl.value) { connectRealtime(); scheduleRealtimeFallback(); } else { if (isLoggedIn.value) startPolling(); startProbePolling(); } });
+                    document.addEventListener('visibilitychange', () => { if (document.hidden) { realtimeGeneration++; realtimeDisconnectedAt = 0; publicRealtimeDisconnectedAt = 0; stopPolling(); stopProbePolling(); clearInterval(realtimePingTimer); clearInterval(publicRealtimeActivityTimer); clearTimeout(realtimeFallbackTimer); clearTimeout(realtimeReconnectTimer); clearTimeout(publicRealtimeReconnectTimer); const socket = realtimeSocket; realtimeSocket = null; socket?.close(); const publicSocket = publicRealtimeSocket; publicRealtimeSocket = null; publicSocket?.close(); realtimeConnected.value = false; window.kuiRealtimeConnected = false; } else if (isLoggedIn.value && role.value === 'admin' && realtimeUrl.value) { connectRealtime(); scheduleRealtimeFallback(); } else if (!isLoggedIn.value && realtimeUrl.value && probeSys.is_public === 'true') { connectPublicRealtime(); } else { if (isLoggedIn.value) startPolling(); startProbePolling(); } });
                 });
 
                 return { 
