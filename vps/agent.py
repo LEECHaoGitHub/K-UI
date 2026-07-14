@@ -928,6 +928,11 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
                             all_keywords.extend(entry["keywords"])
                             all_suffixes.extend(entry["suffixes"])
                     if all_keywords or all_suffixes:
+                        proxy_inbounds = {f"in-{node['id']}" for node in valid_nodes if node.get("protocol") != "dokodemo-door"}
+                        # Domain rules only work after sing-box extracts the TLS/HTTP
+                        # destination from inbound traffic. sing-box 1.13 requires
+                        # this as a non-final route action, not legacy inbound fields.
+                        singbox_config["route"]["rules"].insert(0, {"inbound": sorted(proxy_inbounds), "action": "sniff", "timeout": "1s"})
                         route_rule = {"domain_keyword": all_keywords, "domain_suffix": all_suffixes, "outbound": s5_tag}
                         singbox_config["route"]["rules"].append(route_rule)
                 else:
